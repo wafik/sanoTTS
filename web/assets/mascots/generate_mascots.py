@@ -401,6 +401,37 @@ def mcu():
     return im
 
 
+def trellis():
+    """Spider on a woven web -- the factorized trellis the model is named for."""
+    im, d = common_canvas()
+    floor_shadow(d, 8, 24)
+    # Anchor threads radiating from the top corners, then the woven rings.
+    for end in ((3, 14), (10, 17), (21, 17), (28, 14)):
+        d.line([(16, 1), end], fill=SILVER_DARK, width=1)
+    d.line([(3, 3), (28, 3)], fill=SILVER_DARK, width=1)
+    for ring in (5, 8, 11):
+        d.line([(16 - ring, 3 + ring // 2), (16, 3 + ring),
+                (16 + ring, 3 + ring // 2)], fill=SILVER, width=1)
+    # Dew beads where the strands cross, the crimson accent of the set.
+    px(d, 11, 8, CRIMSON)
+    px(d, 21, 8, CRIMSON)
+    # Spider: round body, bright eyes, eight blocky legs.
+    ellipse(d, (12, 15, 19, 22), OUTLINE)
+    ellipse(d, (13, 16, 18, 21), INK)
+    px(d, 14, 17, WHITE)
+    px(d, 17, 17, WHITE)
+    px(d, 14, 18, OUTLINE)
+    px(d, 17, 18, OUTLINE)
+    rect(d, (15, 20, 16, 20), CRIMSON)
+    for y, drop in ((16, 2), (18, 0), (20, 1), (22, 3)):
+        d.line([(12, y), (9, y - drop), (7, y - drop + 1)], fill=OUTLINE, width=1)
+        d.line([(19, y), (22, y - drop), (24, y - drop + 1)], fill=OUTLINE, width=1)
+    # Silk thread anchoring the spider back up into the web.
+    d.line([(16, 12), (16, 15)], fill=SILVER_DARK, width=1)
+    us_pin(d, 22, 24)
+    return im
+
+
 def render(sprite, filename, description):
     # Scale only once, with no antialiasing, to retain the 32 px grid.
     sprite = sprite.resize((SIZE, SIZE), Image.Resampling.NEAREST)
@@ -431,6 +462,7 @@ def main():
         "hindi.png": (hindi, "Hindi — peacock with India flag badge"),
         "chinese.png": (chinese, "Chinese — giant panda with China flag badge"),
         "mcu.png": (mcu, "MCU — tiny robot with ESP32 development board torso"),
+        "trellis.png": (trellis, "Trellis — spider on a woven web with United States flag pin"),
     }
     for filename, (builder, description) in mascots.items():
         render(builder(), filename, description)

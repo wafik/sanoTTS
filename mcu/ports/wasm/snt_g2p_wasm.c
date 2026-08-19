@@ -36,6 +36,33 @@
 #define ID_PAD 0
 #define ID_EOS 2
 
+/* phonememode for snt_g2p_text_to_ipa() -- byte-for-byte the value python
+ * phonemizer 3.x passes to espeak_TextToPhonemes() when EspeakBackend is
+ * constructed with tie=... (see phonemizer/backend/espeak/wrapper.py:353,
+ * "phonemes_mode = 0x02 | 0x01 << 7 | ord('͡') << 8").
+ *
+ * Justified by mcu/ports/wasm/espeak/include/espeak-ng/speak_lib.h:
+ *   #define espeakPHONEMES_IPA  0x02   -- "bit 1: ... 1= International
+ *                                          Phonetic Alphabet (as UTF-8)"
+ *   #define espeakPHONEMES_TIE  0x80   -- "bit 7: use (bits 8-23) as a tie
+ *                                          within multi-letter phoneme names"
+ *   bits 8-23                          -- the tie/separator character itself
+ *
+ * phonemizer always asks espeak for the DEFAULT U+0361 COMBINING DOUBLE
+ * INVERTED BREVE and only afterwards rewrites it to the caller's tie
+ * character ('^' for misaki), so this shim emits U+0361 too and leaves the
+ * '͡' -> '^' rewrite to the JS side (web/trellis_frontend.js).
+ *
+ *   0x02 | 0x80 | (0x361 << 8) == 0x36182 == 221570
+ */
+#define SNT_TIE_CP 0x0361
+#define SNT_IPA_TIE_PHONEMEMODE (espeakPHONEMES_IPA | espeakPHONEMES_TIE | (SNT_TIE_CP << 8))
+
+/* Name of the espeak voice currently selected, so snt_g2p_text_to_ipa() can
+ * force "en-us" and put the caller's voice back -- the legacy
+ * snt_g2p_text_to_ids() path must not observe any state change. */
+static char g_voice_name[64] = "en-us";
+
 /* Active id table -- defaults to kristin (slot 0), the original contract. */
 static const cp_id_t *g_tab = CP_ID_KRISTIN;
 static int g_tab_n = (int)(sizeof(CP_ID_KRISTIN) / sizeof(CP_ID_KRISTIN[0]));
@@ -74,6 +101,9 @@ int snt_g2p_init(void) {
          * voice the ESP32 port uses; still English G2P, same rule tables. */
         s = espeak_ng_SetVoiceByName("en");
         if (s != ENS_OK) { printf("g2p: set voice failed (0x%x)\n", (unsigned)s); return -3; }
+        snprintf(g_voice_name, sizeof(g_voice_name), "%s", "en");
+    } else {
+        snprintf(g_voice_name, sizeof(g_voice_name), "%s", "en-us");
     }
     g_ready = 1;
     printf("g2p: espeak ready (voice en-us)\n");
@@ -97,11 +127,78 @@ int snt_g2p_set_voice(const char *espeak_voice, int voice_slot) {
         printf("g2p: set voice '%s' failed (0x%x)\n", espeak_voice, (unsigned)s);
         return -2;
     }
+    snprintf(g_voice_name, sizeof(g_voice_name), "%s", espeak_voice);
     g_tab = SNT_VOICE_TABS[voice_slot].tab;
     g_tab_n = SNT_VOICE_TABS[voice_slot].n;
     printf("g2p: voice '%s' + id table '%s' (slot %d, %d entries)\n",
            espeak_voice, SNT_VOICE_TABS[voice_slot].name, voice_slot, g_tab_n);
     return 0;
+}
+
+/* Raw IPA phoneme string for the Trellis-RIFT (Misaki/Kokoro) frontend.
+ *
+ * This is NOT the legacy Piper path: no id mapping, no BOS/PAD/EOS framing,
+ * nothing about snt_g2p_text_to_ids() changes. It reproduces
+ * phonemizer.backend.espeak.wrapper.EspeakWrapper.text_to_phonemes(text,
+ * tie='͡') exactly: repeatedly call espeak_TextToPhonemes() until the text
+ * pointer becomes NULL, drop empty clause results, and join the remaining
+ * clause strings with a single space.
+ *
+ * Output carries stress marks (ˈ ˌ), IPA symbols and U+0361 ties. The
+ * misaki-side '͡' -> '^' rewrite, punctuation restoration and E2M
+ * normalization all happen in web/trellis_frontend.js.
+ *
+ * The espeak voice is forced to "en-us" (misaki EspeakFallback(british=False))
+ * and the caller's previous voice is restored before returning.
+ *
+ * Returns the number of bytes written (excluding the NUL terminator), or a
+ * negative error code:
+ *   -1 bad arguments / init failure
+ *   -2 could not select the "en-us" voice
+ *   -3 output buffer too small (out is left NUL-terminated but truncated)
+ *   -4 clause loop did not terminate (espeak refused to advance the pointer)
+ *   -5 could not restore the caller's voice (output is still valid)
+ */
+SNT_EXPORT
+int snt_g2p_text_to_ipa(const char *text, char *out, int max_len) {
+    if (!g_ready) { int rc = snt_g2p_init(); if (rc != 0) return -1; }
+    if (!text || !out || max_len <= 0) return -1;
+    out[0] = '\0';
+
+    char prev_voice[sizeof(g_voice_name)];
+    snprintf(prev_voice, sizeof(prev_voice), "%s", g_voice_name);
+    int switched = strcmp(prev_voice, "en-us") != 0;
+    if (switched && espeak_ng_SetVoiceByName("en-us") != ENS_OK) {
+        printf("g2p: text_to_ipa could not select en-us\n");
+        return -2;
+    }
+
+    int n = 0;          /* bytes written so far, excluding NUL */
+    int clauses = 0;    /* number of non-empty clause results appended */
+    int rc = 0;
+    const void *tp = text;
+    int guard = 0;
+
+    /* python: `while text_ptr.contents.value is not None` -- the loop ends
+     * when espeak nulls the pointer, NOT when it reaches an empty string. */
+    while (tp != NULL) {
+        if (guard++ > 4096) { rc = -4; break; }
+        const char *ph = espeak_TextToPhonemes(&tp, espeakCHARS_UTF8, SNT_IPA_TIE_PHONEMEMODE);
+        if (!ph || !*ph) continue;   /* python skips falsy (empty) results */
+        int need = (int)strlen(ph) + (clauses > 0 ? 1 : 0);
+        if (n + need + 1 > max_len) { rc = -3; break; }
+        if (clauses > 0) out[n++] = ' ';
+        memcpy(out + n, ph, strlen(ph));
+        n += (int)strlen(ph);
+        out[n] = '\0';
+        clauses++;
+    }
+
+    if (switched && espeak_ng_SetVoiceByName(prev_voice) != ENS_OK) {
+        printf("g2p: text_to_ipa could not restore voice '%s'\n", prev_voice);
+        if (rc == 0) rc = -5;
+    }
+    return rc != 0 ? rc : n;
 }
 
 SNT_EXPORT

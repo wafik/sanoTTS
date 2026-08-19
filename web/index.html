@@ -174,8 +174,9 @@
     <li>under <b>4&nbsp;MB</b> per voice, zero dependencies (espeak-ng phonemizer included)</li>
     <li><b>9 voices</b> across <b>6 languages</b> &mdash; English, Nepali (नेपाली), Hindi (हिन्दी),
       Vietnamese (Tiếng Việt), Indonesian (Bahasa), Chinese (中文) &mdash; all synthesizing live on this page</li>
-    <li><b>new:</b> <b>trellis</b> &mdash; an entirely new architecture, a complete voice
-      <b>under 1M parameters</b>, in the listening gallery below</li>
+    <li><b>new:</b> <b>trellis</b> &mdash; an entirely new architecture: a complete voice
+      <b>under 1M parameters</b> that also synthesizes live below, and runs about
+      <b>5&times; faster</b> in the browser than our 1.4M&ndash;1.8M voices</li>
     <li>open source, <b>GPL-3.0</b></li>
   </ul>
 
@@ -207,7 +208,7 @@
       </tr>
       <tr>
         <td class="voices-cell"><div class="vrow"><span class="vname">trellis</span><span class="vparams">995k params</span> <span class="pill ghost">new architecture</span>
-          <span class="vnote">our newest voice — an entirely new low-rank factorized stack, complete text-to-wave under one million parameters, 24&nbsp;kHz. Research preview: listening only for now.</span></div></td>
+          <span class="vnote">our newest voice — an entirely new low-rank factorized stack, complete text-to-wave under one million parameters at 24&nbsp;kHz. It also synthesizes your own text live below.</span></div></td>
         <td class="listen-cell"><audio controls preload="none" src="samples-release/english-trellis-1.mp3" title="Welcome! This entire voice runs in under four megabytes, with no cloud at all."></audio></td>
       </tr>
       <tr>
@@ -401,9 +402,11 @@
   <a href="https://github.com/Ampixa/sanoTTS">github.com/Ampixa/sanoTTS</a>.</p>
   <p class="copyright">© 2026 Ampixa</p>
 
-<script src="snt_tts.js?v=20260714"></script>
-<script src="snt_g2p.js?v=20260714"></script>
-<script src="snt_voice.js?v=20260714"></script>
+<script src="snt_tts.js?v=20260819"></script>
+<script src="snt_g2p.js?v=20260819"></script>
+<script src="snt_voice.js?v=20260819"></script>
+<script src="snt_trellis.js?v=20260819"></script>
+<script src="trellis_frontend.js?v=20260819"></script>
 <script>
 // ARENA: the esp32 build lives inside 320KB SRAM, but the browser has no such
 // budget -- 2MB covers paragraph-length chunks (320KB OOMs past ~100 ids).
@@ -430,6 +433,11 @@ const VOICES = [
   {key:"chinese",  label:"Chinese",    params:"1.50M", flag:"\uD83C\uDDE8\uD83C\uDDF3", live:true, emj:"\uD83D\uDC3C"},
   {key:"mcu",      label:"English",    params:"745k",  flag:"\uD83C\uDDFA\uD83C\uDDF8", live:true, emj:"\uD83E\uDD16",
     espeakVoice:"en-us", g2pSlot:0, lengthScale:1.0},
+  // Different architecture and a different frontend contract from every voice
+  // above: character-level Misaki phonemes into the Trellis-RIFT stack, so it
+  // runs through SaanoTrellis rather than SaanoVoice. Marked `trellis:true`.
+  {key:"trellis",  label:"trellis",    params:"995k",  flag:"\uD83C\uDDFA\uD83C\uDDF8", live:true, emj:"\uD83D\uDD78\uFE0F",
+    trellis:true},
 ];
 let voice = VOICES[0];
 // Native default sentence per voice, swapped into the textarea on every mascot
@@ -440,6 +448,7 @@ const DEFAULT_TEXT = {
   amy:     "Hello! I am a tiny voice living in your browser.",
   kristin: "Hello! I am a tiny voice living in your browser.",
   hfc:     "Hello! I am a tiny voice living in your browser.",
+  trellis: "Hello! I am a tiny voice living in your browser.",
   vietnamese: "Xin chào! Hôm nay trời đẹp quá.",
   indonesian: "Selamat pagi! Hari ini cuaca sangat cerah.",
   nepali:  "नमस्ते! आज मौसम धेरै राम्रो छ।",
@@ -472,7 +481,8 @@ function renderMascots() {
       // Lazy-fetch this voice's blobs on select so the first click of
       // "Synthesize" doesn't pay the network round-trip; synth() awaits the
       // same cached promise if the prefetch hasn't resolved yet.
-      if (v.key !== "mcu") loadVoiceBundle(v.key).catch(e => log("prefetch " + v.key + ": " + (e && e.message || e)));
+      if (v.trellis) loadTrellisBundle().catch(e => log("prefetch trellis: " + (e && e.message || e)));
+      else if (v.key !== "mcu") loadVoiceBundle(v.key).catch(e => log("prefetch " + v.key + ": " + (e && e.message || e)));
     };
     box.appendChild(b);
   }
@@ -482,8 +492,9 @@ function updateUI() {
   $("go").textContent = "Synthesize & play";
 }
 
-let Mod=null, G2P=null, Voice=null, audioCtx=null, lastPcm=null, mcuAssets=null;
+let Mod=null, G2P=null, Voice=null, Trellis=null, audioCtx=null, lastPcm=null, mcuAssets=null;
 const voiceBundles = new Map(); // key -> Promise<{meta,front,dec}>
+let trellisBundle=null, trellisFrontend=null;
 
 async function fetchBytes(url){ const r=await fetch(url);
   if(!r.ok) throw new Error("fetch "+url+": "+r.status); return new Uint8Array(await r.arrayBuffer()); }
@@ -495,6 +506,22 @@ async function loadMcuAssets(){
   if(mcuAssets) return mcuAssets;
   const [front,dec]=await Promise.all(["front_q8.bin","model_q8.bin"].map(f=>fetchBytes(ASSET+f)));
   mcuAssets={front,dec}; return mcuAssets;
+}
+// The Trellis-RIFT voice ships as ONE self-describing blob (metadata header +
+// 995,058 little-endian float32); snt_trellis splits it internally, so unlike
+// the piperlite voices there is no separate front/dec pair or meta.json.
+function loadTrellisBundle(onProgress){
+  if(!trellisBundle){
+    trellisBundle = (async () => {
+      if(onProgress) onProgress("downloading trellis voice model…");
+      const t0 = performance.now();
+      const bytes = await fetchBytes("voices/trellis/bundle.bin");
+      if(onProgress) onProgress("model loaded: " + (bytes.length/1048576).toFixed(1) +
+        " MB in " + ((performance.now()-t0)/1000).toFixed(2) + " s");
+      return bytes;
+    })();
+  }
+  return trellisBundle;
 }
 function loadVoiceBundle(key, onProgress){
   if(!voiceBundles.has(key)){
@@ -627,6 +654,41 @@ async function synthVoice(key, text){
   if(n<0) throw new Error("snt_voice_synthesize returned "+n);
   return {pcm, ids, wall, sr:bundle.meta.sample_rate||SR};
 }
+// Trellis-RIFT lane. The phoneme path is NOT the Piper id table the other
+// voices use: espeak-ng emits IPA with stress marks and ties, trellis_frontend
+// applies the Misaki normalization, and the model consumes a character-level
+// tokenization of the result. Verified against the Python packaging path on a
+// 159-sentence corpus (mcu/ports/wasm/verify_trellis_frontend_node.mjs).
+async function synthTrellis(text){
+  const bundle = await loadTrellisBundle();
+  if(!trellisFrontend){
+    if(!self.SaanoTrellisFrontend) throw new Error("trellis_frontend.js did not load");
+    trellisFrontend = self.SaanoTrellisFrontend.createFrontend({module:G2P});
+  }
+  // textToIds returns a plain Array, not a typed array -- copy through an
+  // Int32Array so the bytes handed to wasm are actually the ids.
+  const {ids} = trellisFrontend.textToIds(text);
+  const ids32 = Int32Array.from(ids);
+  const bP=toHeap(Trellis,bundle);
+  const idsP=toHeap(Trellis,new Uint8Array(ids32.buffer,0,ids32.length*4));
+  const errP=Trellis._malloc(4);
+  let h=0, pcm=null, wall=0, sr=24000;
+  try{
+    const t0=performance.now();
+    h=Trellis._snt_trellis_wasm_run(bP,bundle.length,idsP,ids32.length,0,0,errP);
+    wall=(performance.now()-t0)/1000;
+    if(!h) throw new Error("trellis synthesis failed, code "+Trellis.HEAP32[errP>>2]);
+    const n=Trellis._snt_trellis_wasm_samples(h);
+    sr=Trellis._snt_trellis_wasm_handle_sample_rate(h)||24000;
+    const wp=Trellis._snt_trellis_wasm_stage(h,7); // 7 = waveform (float32)
+    if(!wp || wp<0) throw new Error("trellis returned no waveform");
+    pcm=new Float32Array(n); pcm.set(Trellis.HEAPF32.subarray(wp>>2,(wp>>2)+n));
+  } finally {
+    if(h) Trellis._snt_trellis_wasm_release(h);
+    [bP,idsP,errP].forEach(p=>Trellis._free(p));
+  }
+  return {pcm, ids, wall, sr};
+}
 async function synth(){
   $("go").disabled=true; $("log").textContent="";
   const setState = m => { $("state").textContent = m; };
@@ -637,11 +699,13 @@ async function synth(){
 
     // model download/load feedback (cached bundles resolve instantly)
     if (voice.key === "mcu") { setState("loading model\u2026"); await uiBreath(); await loadMcuAssets(); }
+    else if (voice.trellis) await loadTrellisBundle(m => { setState(m); log(m); });
     else await loadVoiceBundle(voice.key, m => { setState(m); log(m); });
     await uiBreath();
 
     const chunks = splitChunks(text);
-    const doChunk = t => voice.key==="mcu" ? synthMcu(t) : synthVoice(voice.key, t);
+    const doChunk = t => voice.trellis ? synthTrellis(t)
+                       : voice.key==="mcu" ? synthMcu(t) : synthVoice(voice.key, t);
     let player=null, ttfu=null, totalIds=0, totalWall=0;
     const pcms=[];
     for (let i = 0; i < chunks.length; i++){
@@ -674,8 +738,8 @@ async function synth(){
 }
 let lastSr = SR;
 renderMascots(); updateUI();
-Promise.all([SaanoTTS(), SaanoG2P(), SaanoVoice()]).then(([m,g,v])=>{
-  Mod=m; G2P=g; Voice=v;
+Promise.all([SaanoTTS(), SaanoG2P(), SaanoVoice(), SaanoTrellis()]).then(([m,g,v,t])=>{
+  Mod=m; G2P=g; Voice=v; Trellis=t;
   const rc=G2P._snt_g2p_init ? G2P._snt_g2p_init() : 0;
   $("state").textContent="ready.";
   $("go").disabled=false;

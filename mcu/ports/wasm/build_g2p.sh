@@ -77,8 +77,8 @@ emcc \
   --preload-file "$data@/espeak" \
   -sMODULARIZE=1 -sEXPORT_NAME=SaanoG2P \
   -sINITIAL_MEMORY=33554432 \
-  -sEXPORTED_FUNCTIONS='_malloc,_free,_snt_g2p_init,_snt_g2p_set_voice,_snt_g2p_text_to_ids' \
-  -sEXPORTED_RUNTIME_METHODS='cwrap,HEAP32,HEAPU8,stringToUTF8,lengthBytesUTF8' \
+  -sEXPORTED_FUNCTIONS='_malloc,_free,_snt_g2p_init,_snt_g2p_set_voice,_snt_g2p_text_to_ids,_snt_g2p_text_to_ipa' \
+  -sEXPORTED_RUNTIME_METHODS='cwrap,HEAP32,HEAPU8,stringToUTF8,UTF8ToString,lengthBytesUTF8' \
   -sENVIRONMENT=web,worker,node \
   -o "$web/snt_g2p.js"
 
