@@ -174,6 +174,8 @@
     <li>under <b>4&nbsp;MB</b> per voice, zero dependencies (espeak-ng phonemizer included)</li>
     <li><b>9 voices</b> across <b>6 languages</b> &mdash; English, Nepali (नेपाली), Hindi (हिन्दी),
       Vietnamese (Tiếng Việt), Indonesian (Bahasa), Chinese (中文) &mdash; all synthesizing live on this page</li>
+    <li><b>new:</b> <b>trellis</b> &mdash; an entirely new architecture, a complete voice
+      <b>under 1M parameters</b>, in the listening gallery below</li>
     <li>open source, <b>GPL-3.0</b></li>
   </ul>
 
@@ -187,7 +189,7 @@
     <thead><tr><th>Language</th><th>Voice</th><th>Listen</th></tr></thead>
     <tbody>
       <tr class="lang-first">
-        <td class="lang-cell" rowspan="5">English 🇺🇸</td>
+        <td class="lang-cell" rowspan="6">English 🇺🇸</td>
         <td class="voices-cell"><div class="vrow"><span class="vname">amy</span><span class="vparams">1.46M params</span> <span class="pill">SCOREQ 4.13</span></div></td>
         <td class="listen-cell"><audio controls preload="none" src="samples-release/english-amy-1.mp3" title="Welcome! This entire voice runs in under four megabytes, with no cloud at all."></audio></td>
       </tr>
@@ -202,6 +204,11 @@
       <tr>
         <td class="voices-cell"><div class="vrow"><span class="vname">amy-small</span><span class="vparams">1.08M params</span> <span class="pill">SCOREQ 3.70</span></div></td>
         <td class="listen-cell"><audio controls preload="none" src="samples-release/english-amy-small-1.mp3" title="Welcome! This entire voice runs in under four megabytes, with no cloud at all."></audio></td>
+      </tr>
+      <tr>
+        <td class="voices-cell"><div class="vrow"><span class="vname">trellis</span><span class="vparams">995k params</span> <span class="pill ghost">new architecture</span>
+          <span class="vnote">our newest voice — an entirely new low-rank factorized stack, complete text-to-wave under one million parameters, 24&nbsp;kHz. Research preview: listening only for now.</span></div></td>
+        <td class="listen-cell"><audio controls preload="none" src="samples-release/english-trellis-1.mp3" title="Welcome! This entire voice runs in under four megabytes, with no cloud at all."></audio></td>
       </tr>
       <tr>
         <td class="voices-cell"><div class="vrow"><span class="vname">robot (on-device)</span><span class="vparams">745k params</span> <span class="pill mute">int8 · on-chip</span>

@@ -23,6 +23,18 @@
    "mp3": "english-kristin-2.mp3"
   }
  ],
+ "english-trellis": [
+  {
+   "n": 1,
+   "text": "Welcome! This entire voice runs in under four megabytes, with no cloud at all.",
+   "mp3": "english-trellis-1.mp3"
+  },
+  {
+   "n": 2,
+   "text": "It's a bright, clear morning. A perfect day to build something small and useful.",
+   "mp3": "english-trellis-2.mp3"
+  }
+ ],
  "english-hfc": [
   {
    "n": 1,

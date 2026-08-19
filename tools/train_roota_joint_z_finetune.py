@@ -228,17 +228,18 @@ def load_or_create_acoustic_model(
     )
 
 
-def load_piperlite_decoder_checkpoint(
+def load_decoder_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
 ) -> tuple[decoder_trainer.DecoderStudent, dict[str, Any]]:
-    checkpoint = decoder_trainer.load_torch_checkpoint(checkpoint_path, "Piperlite decoder checkpoint")
+    checkpoint = decoder_trainer.load_torch_checkpoint(checkpoint_path, "decoder checkpoint")
     config = checkpoint.get("config")
     if not isinstance(config, dict):
         raise RuntimeError(f"{checkpoint_path}: missing decoder checkpoint config")
-    if str(config.get("variant") or "") != "piperlite":
+    variant = str(config.get("variant") or "")
+    if variant not in {"piperlite", "wavehax"}:
         raise RuntimeError(
-            f"{checkpoint_path}: joint z fine-tune requires decoder variant piperlite, got {config.get('variant')!r}"
+            f"{checkpoint_path}: joint z fine-tune requires decoder variant piperlite or wavehax, got {variant!r}"
         )
     state = checkpoint.get("model_state_dict")
     if not isinstance(state, dict):
@@ -463,11 +464,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     device = joint_common.pick_device(str(args.device))
     rows, samples, source_in_channels = decoder_trainer.load_samples(args.pack_dir, args.teacher_decoder)
-    if int(source_in_channels) != 192:
-        raise RuntimeError(f"{args.pack_dir}: expected 192-channel generator_input, got {source_in_channels}")
+    # Channel width is dictated by the pack (192 for piper-latent z, 80 for
+    # mel packs, 82 for mel+F0+voiced kokoro packs); the acoustic/decoder
+    # width checks below enforce the real consistency contract.
+    if int(source_in_channels) not in (80, 82, 83, 192):
+        raise RuntimeError(f"{args.pack_dir}: unexpected generator_input channels {source_in_channels}")
 
     acoustic_model, acoustic_config, acoustic_init = load_or_create_acoustic_model(args, samples=samples, device=device)
-    decoder_model, decoder_config = load_piperlite_decoder_checkpoint(args.decoder_checkpoint, device)
+    decoder_model, decoder_config = load_decoder_checkpoint(args.decoder_checkpoint, device)
     if int(acoustic_config.get("out_channels") or 0) != int(source_in_channels):
         raise RuntimeError(
             f"{args.acoustic_checkpoint}: acoustic out_channels {acoustic_config.get('out_channels')} "
@@ -478,8 +482,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             f"{args.decoder_checkpoint}: decoder in_channels {decoder_config.get('in_channels')} "
             f"!= pack channels {source_in_channels}"
         )
-    if str(decoder_config.get("variant") or "") != "piperlite":
-        raise RuntimeError(f"{args.decoder_checkpoint}: expected piperlite decoder")
+    if str(decoder_config.get("variant") or "") not in {"piperlite", "wavehax"}:
+        raise RuntimeError(f"{args.decoder_checkpoint}: expected piperlite or wavehax decoder")
 
     acoustic_model.train()
     decoder_model.train()

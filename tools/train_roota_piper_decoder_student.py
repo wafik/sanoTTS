@@ -32,13 +32,19 @@ import onnxruntime as ort
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.utils.parametrizations import weight_norm
 
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
-from roota_fsd_blocks import FsdConvNeXtBlock, logmag_phase_synthesize
+from roota_fsd_blocks import (
+    FactorizedSpectralHead,
+    FsdConvNeXtBlock,
+    initialize_factorized_spectral_head,
+    logmag_phase_synthesize,
+)
 
 DEFAULT_PACK_DIR = (
     ROOT
@@ -128,11 +134,178 @@ class SnakeActivation(nn.Module):
         return x + torch.sin(alpha * x).square() / alpha
 
 
+class SnakeBetaActivation(nn.Module):
+    """SnakeBeta: x + sin(alpha*x)^2 / beta, with separate per-channel alpha/beta.
+
+    Same log-scale/clamp convention as SnakeActivation above. Ported from
+    NVIDIA/BigVGAN's SnakeBeta (alpha_logscale=True variant):
+    https://github.com/NVIDIA/BigVGAN/blob/main/activations.py
+    which itself credits https://arxiv.org/abs/2006.08195 (Liu, Hartwig, Ueda).
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}")
+        self.log_alpha = nn.Parameter(torch.zeros(channels, dtype=torch.float32))
+        self.log_beta = nn.Parameter(torch.zeros(channels, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise RuntimeError(f"expected activation input [batch, channels, time], got {x.shape}")
+        if x.shape[1] != self.log_alpha.numel():
+            raise RuntimeError(
+                f"activation channel mismatch: input has {x.shape[1]}, activation has {self.log_alpha.numel()}"
+            )
+        alpha = torch.exp(self.log_alpha).view(1, -1, 1).clamp(min=1e-4, max=100.0)
+        beta = torch.exp(self.log_beta).view(1, -1, 1).clamp(min=1e-4, max=100.0)
+        return x + torch.sin(alpha * x).square() / beta
+
+
+def _sinc(x: torch.Tensor) -> torch.Tensor:
+    """sin(pi*x)/(pi*x), 1 at x == 0. Uses torch.sinc when available."""
+    if hasattr(torch, "sinc"):
+        return torch.sinc(x)
+    return torch.where(
+        x == 0,
+        torch.ones_like(x),
+        torch.sin(math.pi * x) / (math.pi * x),
+    )
+
+
+def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> torch.Tensor:
+    """Design a windowed-sinc lowpass filter with a Kaiser window, shape [1, 1, kernel_size].
+
+    Minimal port of the filter math from junjun3518/alias-free-torch (Apache-2.0),
+    as adapted by NVIDIA/BigVGAN:
+      https://github.com/junjun3518/alias-free-torch/blob/main/alias_free_torch/filter.py
+      https://github.com/NVIDIA/BigVGAN/blob/main/alias_free_activation/torch/filter.py
+    which in turn credits adefossez's julius.lowpass.LowPassFilters (MIT).
+    """
+    if kernel_size <= 0:
+        raise ValueError(f"kernel_size must be positive, got {kernel_size}")
+    if not (0.0 <= cutoff <= 0.5):
+        raise ValueError(f"cutoff must be in [0, 0.5], got {cutoff}")
+    even = kernel_size % 2 == 0
+    half_size = kernel_size // 2
+    delta_f = 4.0 * half_width
+    beta_arg = 2.285 * (half_size - 1) * math.pi * delta_f + 7.95
+    if beta_arg > 50.0:
+        beta = 0.1102 * (beta_arg - 8.7)
+    elif beta_arg >= 21.0:
+        beta = 0.5842 * (beta_arg - 21.0) ** 0.4 + 0.07886 * (beta_arg - 21.0)
+    else:
+        beta = 0.0
+    window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32)
+    if even:
+        time = torch.arange(-half_size, half_size, dtype=torch.float32) + 0.5
+    else:
+        time = torch.arange(kernel_size, dtype=torch.float32) - half_size
+    if cutoff == 0.0:
+        filter_ = torch.zeros_like(time)
+    else:
+        filter_ = 2.0 * cutoff * window * _sinc(2.0 * cutoff * time)
+        filter_ = filter_ / filter_.sum()
+    return filter_.view(1, 1, kernel_size)
+
+
+class AliasFreeUpSample1d(nn.Module):
+    """2x (default) upsample via zero-stuffed transposed conv with a kaiser-sinc filter.
+
+    Port of alias_free_torch/BigVGAN's UpSample1d. Conv-based (transposed conv1d),
+    no FFT, so it runs on MPS same as any other conv1d.
+    https://github.com/NVIDIA/BigVGAN/blob/main/alias_free_activation/torch/resample.py
+    """
+
+    def __init__(self, ratio: int = 2, kernel_size: int = 12) -> None:
+        super().__init__()
+        if ratio <= 0:
+            raise ValueError(f"ratio must be positive, got {ratio}")
+        if kernel_size <= 0:
+            raise ValueError(f"kernel_size must be positive, got {kernel_size}")
+        self.ratio = int(ratio)
+        self.stride = int(ratio)
+        self.pad = kernel_size // ratio - 1
+        self.pad_left = self.pad * self.stride + (kernel_size - self.stride) // 2
+        self.pad_right = self.pad * self.stride + (kernel_size - self.stride + 1) // 2
+        filter_ = kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=kernel_size)
+        self.register_buffer("filter", filter_, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise RuntimeError(f"expected alias-free upsample input [batch, channels, time], got {x.shape}")
+        channels = x.shape[1]
+        x = F.pad(x, (self.pad, self.pad), mode="replicate")
+        x = self.ratio * F.conv_transpose1d(x, self.filter.expand(channels, -1, -1), stride=self.stride, groups=channels)
+        x = x[..., self.pad_left : x.shape[-1] - self.pad_right]
+        return x
+
+
+class AliasFreeDownSample1d(nn.Module):
+    """2x (default) downsample via a kaiser-sinc lowpass conv1d followed by striding.
+
+    Port of alias_free_torch/BigVGAN's DownSample1d (conv1d-based, MPS-safe).
+    https://github.com/NVIDIA/BigVGAN/blob/main/alias_free_activation/torch/resample.py
+    """
+
+    def __init__(self, ratio: int = 2, kernel_size: int = 12) -> None:
+        super().__init__()
+        if ratio <= 0:
+            raise ValueError(f"ratio must be positive, got {ratio}")
+        if kernel_size <= 0:
+            raise ValueError(f"kernel_size must be positive, got {kernel_size}")
+        self.stride = int(ratio)
+        even = kernel_size % 2 == 0
+        self.pad_left = kernel_size // 2 - int(even)
+        self.pad_right = kernel_size // 2
+        filter_ = kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=kernel_size)
+        self.register_buffer("filter", filter_, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise RuntimeError(f"expected alias-free downsample input [batch, channels, time], got {x.shape}")
+        channels = x.shape[1]
+        x = F.pad(x, (self.pad_left, self.pad_right), mode="replicate")
+        return F.conv1d(x, self.filter.expand(channels, -1, -1), stride=self.stride, groups=channels)
+
+
+class AliasFreeActivation1d(nn.Module):
+    """BigVGAN-style AMP block: upsample2x -> activation -> lowpass -> downsample2x.
+
+    This is the anti-aliasing wrapper from BigVGAN (the "AMP" -- anti-aliased
+    multi-periodicity -- activation block). Defaults match BigVGAN: up_ratio=2,
+    down_ratio=2, kernel_size=12 for both filters.
+    https://github.com/NVIDIA/BigVGAN/blob/main/alias_free_activation/torch/act.py
+    """
+
+    def __init__(
+        self,
+        activation: nn.Module,
+        *,
+        up_ratio: int = 2,
+        down_ratio: int = 2,
+        up_kernel_size: int = 12,
+        down_kernel_size: int = 12,
+    ) -> None:
+        super().__init__()
+        self.act = activation
+        self.upsample = AliasFreeUpSample1d(ratio=up_ratio, kernel_size=up_kernel_size)
+        self.downsample = AliasFreeDownSample1d(ratio=down_ratio, kernel_size=down_kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.upsample(x)
+        x = self.act(x)
+        x = self.downsample(x)
+        return x
+
+
 def make_activation(name: str, channels: int, *, negative_slope: float = 0.1) -> nn.Module:
     if name == "leaky_relu":
         return LeakyReluActivation(negative_slope=negative_slope)
     if name == "snake":
         return SnakeActivation(channels)
+    if name == "snakebeta_aa":
+        return AliasFreeActivation1d(SnakeBetaActivation(channels))
     raise ValueError(f"unsupported activation: {name}")
 
 
@@ -860,6 +1033,115 @@ class MultiPeriodDiscriminator(nn.Module):
         return scores, features
 
 
+class SpectralResolutionDiscriminator(nn.Module):
+    """UnivNet-style single-resolution spectral discriminator.
+
+    Operates on the log1p linear-magnitude STFT of the waveform. Uses the same
+    torch.stft call shape (float() input, an explicit hann window built on the
+    module, win_length possibly < n_fft, return_complex=True) as
+    multi_resolution_stft_loss elsewhere in this file, which is the pattern
+    already verified to work on the MPS backend in this trainer.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_fft: int,
+        hop_length: int,
+        win_length: int,
+        channels: tuple[int, ...] = (32, 32, 32, 32),
+    ) -> None:
+        super().__init__()
+        if n_fft <= 0:
+            raise ValueError(f"n_fft must be positive, got {n_fft}")
+        if hop_length <= 0:
+            raise ValueError(f"hop_length must be positive, got {hop_length}")
+        if win_length <= 0 or win_length > n_fft:
+            raise ValueError(f"win_length must be in (0, n_fft], got {win_length} for n_fft={n_fft}")
+        if not channels:
+            raise ValueError("spectral discriminator channels must not be empty")
+        if any(channel <= 0 for channel in channels):
+            raise ValueError(f"spectral discriminator channels must be positive, got {channels}")
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
+        self.win_length = int(win_length)
+        kernel_size = (3, 9)
+        stride = (1, 2)
+        padding = (kernel_size[0] // 2, kernel_size[1] // 2)
+        layers: list[nn.Module] = []
+        in_channels = 1
+        for out_channels in channels:
+            layers.append(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=padding,
+                )
+            )
+            in_channels = out_channels
+        self.layers = nn.ModuleList(layers)
+        self.post = nn.Conv2d(in_channels, 1, kernel_size=(3, 3), padding=(1, 1))
+        self.register_buffer("window", torch.hann_window(self.win_length), persistent=False)
+
+    def forward(self, audio: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if audio.ndim != 3 or audio.shape[1] != 1:
+            raise RuntimeError(f"expected discriminator audio [batch, 1, samples], got {audio.shape}")
+        waveform = audio.squeeze(1).float()
+        spec = torch.stft(
+            waveform,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            return_complex=True,
+        )
+        magnitude = torch.log1p(torch.abs(spec))
+        x = magnitude.unsqueeze(1)
+        features: list[torch.Tensor] = []
+        for layer in self.layers:
+            x = F.leaky_relu(layer(x), negative_slope=0.1)
+            features.append(x)
+        score = self.post(x)
+        features.append(score)
+        return score, features
+
+
+class MultiResolutionSpectralDiscriminator(nn.Module):
+    """Additive UnivNet-style MRD: three SpectralResolutionDiscriminator instances
+    at (n_fft, hop_length, win_length) = (1024,120,600), (2048,240,1200), (512,50,240).
+
+    Exposes the same (scores, features) forward contract as
+    MultiPeriodDiscriminator so it can reuse discriminator_lsgan_loss,
+    generator_lsgan_loss, and discriminator_feature_matching_loss unchanged.
+    """
+
+    resolutions: tuple[tuple[int, int, int], ...] = (
+        (1024, 120, 600),
+        (2048, 240, 1200),
+        (512, 50, 240),
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.discriminators = nn.ModuleList(
+            [
+                SpectralResolutionDiscriminator(n_fft=n_fft, hop_length=hop_length, win_length=win_length)
+                for n_fft, hop_length, win_length in self.resolutions
+            ]
+        )
+
+    def forward(self, audio: torch.Tensor) -> tuple[list[torch.Tensor], list[list[torch.Tensor]]]:
+        scores: list[torch.Tensor] = []
+        features: list[list[torch.Tensor]] = []
+        for discriminator in self.discriminators:
+            score, feature = discriminator(audio)
+            scores.append(score)
+            features.append(feature)
+        return scores, features
+
+
 class LrcEncoder(nn.Module):
     """Training-only z->c encoder for the latent re-contract racer."""
 
@@ -886,6 +1168,1092 @@ class LrcEncoder(nn.Module):
         if int(latent.shape[1]) != self.in_channels:
             raise RuntimeError(f"LRC encoder expected {self.in_channels} channels, got {latent.shape[1]}")
         return self.net(latent)
+
+
+class WavehaxLayerNorm2d(nn.Module):
+    """Global channel/frequency/time normalization used by Wavehax.
+
+    This follows the official Wavehax normalization contract while keeping the
+    implementation local to the decoder checkpoint format.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        if channels <= 0:
+            raise ValueError(f"Wavehax normalization channels must be positive, got {channels}")
+        self.eps = float(eps)
+        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise RuntimeError(f"Wavehax normalization expects [B,C,F,T], got {x.shape}")
+        centered = x - x.mean(dim=(1, 2, 3), keepdim=True)
+        variance = centered.square().mean(dim=(1, 2, 3), keepdim=True)
+        return self.scale * centered * torch.rsqrt(variance + self.eps) + self.bias
+
+
+class WavehaxConvNeXtBlock2d(nn.Module):
+    """Small 2D ConvNeXt block over frequency and time."""
+
+    def __init__(
+        self,
+        channels: int,
+        mult_channels: int,
+        kernel_freq: int,
+        kernel_time: int,
+        layer_scale: float,
+    ) -> None:
+        super().__init__()
+        if channels <= 0 or mult_channels <= 0:
+            raise ValueError("Wavehax channels and multiplier must be positive")
+        if kernel_freq <= 0 or kernel_freq % 2 == 0 or kernel_time <= 0 or kernel_time % 2 == 0:
+            raise ValueError("Wavehax frequency/time kernels must be positive odd integers")
+        expanded = channels * mult_channels
+        self.depthwise = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(kernel_freq, kernel_time),
+            padding=(kernel_freq // 2, kernel_time // 2),
+            padding_mode="reflect",
+            groups=channels,
+            bias=False,
+        )
+        self.norm = WavehaxLayerNorm2d(channels)
+        self.expand = nn.Conv2d(channels, expanded, 1)
+        self.project = nn.Conv2d(expanded, channels, 1)
+        self.layer_scale = nn.Parameter(torch.full((1, channels, 1, 1), float(layer_scale)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.depthwise(x)
+        x = self.norm(x)
+        x = self.expand(x)
+        x = F.gelu(x)
+        x = self.project(x)
+        return residual + self.layer_scale * x
+
+
+class KokoroWavehaxHead(nn.Module):
+    """Wavehax-style complex-spectrogram decoder for Kokoro mel/F0 packs.
+
+    The architecture mirrors the paper's useful inductive bias: a
+    phase-continuous pseudo-constant-power harmonic prior is converted to a
+    complex STFT, fused with the student conditioning through 2D ConvNeXt
+    blocks, and reconstructed by normalized overlap-add.  Unlike the earlier
+    source-filter probes, the prior is input context; it is not asked to carry
+    the waveform by itself.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        n_fft: int,
+        sample_rate: int,
+        channels: int,
+        blocks: int,
+        mult_channels: int,
+        kernel_freq: int,
+        kernel_time: int,
+        f0_channel: int,
+        voiced_channel: int,
+        prior_power: float,
+        prior_noise: float,
+    ) -> None:
+        super().__init__()
+        if n_fft <= HOP_LENGTH or n_fft % 2 != 0:
+            raise ValueError(f"Wavehax n_fft must be even and greater than hop {HOP_LENGTH}, got {n_fft}")
+        if sample_rate <= 0:
+            raise ValueError(f"Wavehax sample rate must be positive, got {sample_rate}")
+        if blocks <= 0:
+            raise ValueError(f"Wavehax block count must be positive, got {blocks}")
+        if not (0 <= f0_channel < in_channels) or not (0 <= voiced_channel < in_channels):
+            raise ValueError(
+                f"Wavehax F0/voiced channels {(f0_channel, voiced_channel)} outside input width {in_channels}"
+            )
+        if f0_channel == voiced_channel:
+            raise ValueError("Wavehax F0 and voiced channels must differ")
+        if prior_power <= 0.0 or prior_noise < 0.0:
+            raise ValueError("Wavehax prior power must be positive and prior noise non-negative")
+        self.in_channels = int(in_channels)
+        self.n_fft = int(n_fft)
+        self.n_bins = self.n_fft // 2 + 1
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self.block_count = int(blocks)
+        self.f0_channel = int(f0_channel)
+        self.voiced_channel = int(voiced_channel)
+        self.prior_power = float(prior_power)
+        self.prior_noise = float(prior_noise)
+
+        # Depthwise temporal smoothing of the prior spectrum. A dense k=7 conv
+        # here costs 462k params (70% of the whole model) for a job that needs
+        # no cross-bin mixing — cross-bin/cross-frame mixing is what the 2D
+        # ConvNeXt blocks are for. Depthwise k=7 is 4.1k params instead.
+        self.prior_projection = nn.Conv1d(
+            self.n_bins,
+            self.n_bins,
+            7,
+            padding=3,
+            padding_mode="reflect",
+            groups=self.n_bins,
+        )
+        self.condition_projection = nn.Conv1d(
+            self.in_channels,
+            self.n_bins,
+            7,
+            padding=3,
+            padding_mode="reflect",
+        )
+        self.input_projection = nn.Conv2d(5, self.channels, 1, bias=False)
+        self.input_norm = WavehaxLayerNorm2d(self.channels)
+        self.blocks = nn.ModuleList(
+            [
+                WavehaxConvNeXtBlock2d(
+                    self.channels,
+                    mult_channels,
+                    kernel_freq,
+                    kernel_time,
+                    layer_scale=1.0 / float(self.block_count),
+                )
+                for _ in range(self.block_count)
+            ]
+        )
+        self.output_norm = WavehaxLayerNorm2d(self.channels)
+        self.output_projection = nn.Conv2d(self.channels, 2, 1)
+        self.register_buffer("window", torch.hann_window(self.n_fft), persistent=False)
+        self.apply(self._initialize_weights)
+
+    @staticmethod
+    def _initialize_weights(module: nn.Module) -> None:
+        if isinstance(module, (nn.Conv1d, nn.Conv2d)):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def _harmonic_prior(self, latent: torch.Tensor) -> torch.Tensor:
+        frames = int(latent.shape[-1])
+        total_samples = frames * HOP_LENGTH
+        log_f0 = latent[:, self.f0_channel : self.f0_channel + 1]
+        voiced = latent[:, self.voiced_channel : self.voiced_channel + 1].clamp(0.0, 1.0)
+        f0 = torch.exp(log_f0.clamp(math.log(50.0), math.log(800.0))) * voiced
+        f0 = F.interpolate(f0, size=total_samples, mode="linear", align_corners=False)
+        voiced = F.interpolate(voiced, size=total_samples, mode="linear", align_corners=False)
+
+        phase_increment = f0.float() / float(self.sample_rate)
+        if self.training:
+            initial_phase = torch.rand(
+                (latent.shape[0], 1, 1),
+                device=latent.device,
+                dtype=phase_increment.dtype,
+            )
+            phase_increment = torch.cat(
+                [phase_increment[..., :1] + initial_phase, phase_increment[..., 1:]],
+                dim=-1,
+            )
+        phase = torch.cumsum(phase_increment, dim=-1)
+        phase = torch.remainder(phase * (2.0 * math.pi), 2.0 * math.pi).to(dtype=latent.dtype)
+        safe_f0 = f0.clamp_min(1.0)
+        harmonic_count = torch.floor((float(self.sample_rate) / 2.0) / safe_f0).clamp_min(1.0)
+        half_phase = phase * 0.5
+        denominator = 2.0 * torch.sin(half_phase)
+        numerator = torch.cos(half_phase) - torch.cos((harmonic_count + 0.5) * phase)
+        valid_denominator = denominator.abs() > 1e-5
+        safe_denominator = torch.where(valid_denominator, denominator, torch.ones_like(denominator))
+        harmonic_sum = torch.where(valid_denominator, numerator / safe_denominator, torch.zeros_like(numerator))
+        amplitude = self.prior_power * torch.sqrt(2.0 / harmonic_count)
+        prior = harmonic_sum * amplitude * voiced
+        if self.prior_noise > 0.0:
+            if self.training:
+                noise = torch.randn_like(prior)
+            else:
+                index = torch.arange(total_samples, device=latent.device, dtype=torch.float32)
+                hashed = torch.sin((index + 1.0) * 12.9898) * 43758.5453
+                noise = ((hashed - torch.floor(hashed)) * 2.0 - 1.0) * math.sqrt(3.0)
+                noise = noise.to(dtype=latent.dtype).view(1, 1, -1).expand_as(prior)
+            prior = prior + self.prior_noise * noise
+        return prior
+
+    def _stft(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pad_total = self.n_fft - HOP_LENGTH
+        padded = F.pad(audio, (pad_total // 2, pad_total - pad_total // 2))
+        frames = padded.squeeze(1).unfold(-1, self.n_fft, HOP_LENGTH)
+        frames = frames * self.window.to(device=audio.device, dtype=audio.dtype).view(1, 1, -1)
+        spectrum = torch.fft.rfft(frames.float(), n=self.n_fft, dim=-1)
+        spectrum = spectrum.transpose(1, 2)
+        return spectrum.real.to(dtype=audio.dtype), spectrum.imag.to(dtype=audio.dtype)
+
+    def _istft(self, real: torch.Tensor, imag: torch.Tensor) -> torch.Tensor:
+        if real.shape != imag.shape or real.ndim != 3 or int(real.shape[1]) != self.n_bins:
+            raise RuntimeError(f"Wavehax complex spectrum shape mismatch: real={real.shape}, imag={imag.shape}")
+        frame_count = int(real.shape[-1])
+        spectrum = torch.complex(real.float(), imag.float()).transpose(1, 2)
+        frames = torch.fft.irfft(spectrum, n=self.n_fft, dim=-1)
+        window = self.window.to(device=real.device, dtype=frames.dtype)
+        frames = frames * window.view(1, 1, -1)
+        fold_input = frames.transpose(1, 2)
+        full_length = (frame_count - 1) * HOP_LENGTH + self.n_fft
+        audio = F.fold(
+            fold_input,
+            output_size=(1, full_length),
+            kernel_size=(1, self.n_fft),
+            stride=(1, HOP_LENGTH),
+        ).reshape(real.shape[0], 1, full_length)
+        envelope_frames = window.square().view(1, self.n_fft, 1).expand(real.shape[0], -1, frame_count)
+        envelope = F.fold(
+            envelope_frames,
+            output_size=(1, full_length),
+            kernel_size=(1, self.n_fft),
+            stride=(1, HOP_LENGTH),
+        ).reshape(real.shape[0], 1, full_length)
+        pad_left = (self.n_fft - HOP_LENGTH) // 2
+        samples = frame_count * HOP_LENGTH
+        audio = audio[..., pad_left : pad_left + samples]
+        envelope = envelope[..., pad_left : pad_left + samples]
+        return (audio / envelope.clamp_min(1e-7)).to(dtype=real.dtype)
+
+    def forward(
+        self,
+        latent: torch.Tensor,
+        *,
+        return_features: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        with torch.no_grad():
+            prior = self._harmonic_prior(latent)
+            prior_real, prior_imag = self._stft(prior)
+        condition = self.condition_projection(latent)
+        x = torch.stack(
+            [
+                prior_real,
+                prior_imag,
+                self.prior_projection(prior_real),
+                self.prior_projection(prior_imag),
+                condition,
+            ],
+            dim=1,
+        )
+        x = self.input_norm(self.input_projection(x))
+        features: dict[str, torch.Tensor] = {"pre": x}
+        for index, block in enumerate(self.blocks):
+            x = block(x)
+            features[f"wavehax_block{index}"] = x
+        features["stage0_mix"] = x
+        complex_params = self.output_projection(self.output_norm(x))
+        real, imag = complex_params[:, 0], complex_params[:, 1]
+        audio = self._istft(real, imag)
+        features["pre_tanh"] = complex_params.flatten(1, 2)
+        features["wavehax_prior"] = prior
+        features["audio_pre_filter"] = audio
+        features["audio"] = audio
+        if return_features:
+            return audio, features
+        return audio
+
+
+class WavehaxFaithfulHead(nn.Module):
+    """Faithful narrow port of the Wavehax vocoder generator (arXiv 2411.06807).
+
+    Ported from the official WavehaxGenerator (wavehax.v1 config) at
+    https://github.com/chomeyama/wavehax (wavehax/generators/wavehax.py,
+    wavehax/modules/{periodic,stft,norm,resblock}.py), adapted only where the
+    83-channel Kokoro generator_input pack differs from the reference's
+    (feature, F0) input pair:
+
+    - Prior: generate_pcph_closed_form (Dirichlet-kernel harmonic sum,
+      amplitude power_factor*sqrt(2/N), broadband noise 0.01), with F0 taken
+      from the pack's log-F0/voicing channels instead of a separate F0 input.
+    - Input projection topology per the official repo: a DENSE Conv1d(F, F, 7)
+      applied to the prior real and imaginary spectrograms, a Conv1d(83, F, 7)
+      conditioning projection, then torch.stack([real, imag, proj(real),
+      proj(imag), cond]) -> Conv2d(5, C, 1) -> LayerNorm2d. (The earlier
+      "wavehax" variant in this file made prior_proj depthwise; the official
+      layer is dense.)
+    - Body: `blocks` ConvNeXt2d blocks (depthwise 7x7 reflect-padded, global
+      LayerNorm2d, pointwise C->C'->C with GELU, layer-scale 1/blocks).
+    - Output: LayerNorm2d -> Conv2d(C, 2, 1) -> direct real/imag complex
+      spectrogram -> window-envelope-normalized iSTFT overlap-add. The paper
+      and official repo estimate the output spectrogram directly; the prior
+      enters ONLY through the 5-channel input stack (no output-side prior
+      residual).
+
+    Deliberate deviations from the literal reference, all precedented in this
+    file (HiftSineGen, KokoroWavehaxHead) and needed for this trainer:
+    - Random initial prior phase and stochastic prior noise are gated on
+      self.training; eval uses zero initial phase and a deterministic hashed
+      noise sequence so probe/eval renders are bit-reproducible.
+    - Phase accumulation runs in float32 (the reference cumsums in float64,
+      which MPS does not support). At 24 kHz the fp32 phase error over a
+      multi-second render is far below one millicycle.
+    - The reference STFT's conv1d-with-identity-kernel framing is implemented
+      with unfold/fold + torch.fft.rfft/irfft, mathematically identical and
+      MPS-safe; torch.istft(center=True) is NOT used because its n_fft//2
+      centering convention would produce frames+1 spectral frames per
+      frames*hop samples and break the 1:1 frame alignment between the prior,
+      the conditioning, and the output.
+    """
+
+    PRIOR_POWER = 0.1
+    PRIOR_NOISE = 0.01
+    KERNEL_SIZE = 7
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        channels: int,
+        hidden_channels: int,
+        blocks: int,
+        n_fft: int,
+        f0_channel: int,
+        voiced_channel: int,
+        sample_rate: int,
+    ) -> None:
+        super().__init__()
+        if in_channels <= 0:
+            raise ValueError(f"wavehax_faithful in_channels must be positive, got {in_channels}")
+        if channels <= 0:
+            raise ValueError(f"wavehax_faithful channels must be positive, got {channels}")
+        if hidden_channels <= 0 or hidden_channels % channels != 0:
+            raise ValueError(
+                f"wavehax_faithful hidden_channels must be a positive multiple of channels "
+                f"{channels}, got {hidden_channels}"
+            )
+        if blocks <= 0:
+            raise ValueError(f"wavehax_faithful blocks must be positive, got {blocks}")
+        if n_fft <= HOP_LENGTH or n_fft % 2 != 0:
+            raise ValueError(
+                f"wavehax_faithful n_fft must be even and greater than hop {HOP_LENGTH}, got {n_fft}"
+            )
+        if not (0 <= f0_channel < in_channels) or not (0 <= voiced_channel < in_channels):
+            raise ValueError(
+                f"wavehax_faithful F0/voiced channels {(f0_channel, voiced_channel)} "
+                f"outside input width {in_channels}"
+            )
+        if f0_channel == voiced_channel:
+            raise ValueError("wavehax_faithful F0 and voiced channels must differ")
+        if sample_rate <= 0:
+            raise ValueError(f"wavehax_faithful sample rate must be positive, got {sample_rate}")
+        self.in_channels = int(in_channels)
+        self.channels = int(channels)
+        self.hidden_channels = int(hidden_channels)
+        self.block_count = int(blocks)
+        self.n_fft = int(n_fft)
+        self.n_bins = self.n_fft // 2 + 1
+        self.f0_channel = int(f0_channel)
+        self.voiced_channel = int(voiced_channel)
+        self.sample_rate = int(sample_rate)
+
+        # Official Wavehax input projections: DENSE prior projection shared by
+        # the real and imaginary parts, plus the conditioning projection that
+        # lifts the 83-channel pack onto the frequency axis.
+        self.prior_proj = nn.Conv1d(
+            self.n_bins,
+            self.n_bins,
+            self.KERNEL_SIZE,
+            padding=self.KERNEL_SIZE // 2,
+            padding_mode="reflect",
+        )
+        self.cond_proj = nn.Conv1d(
+            self.in_channels,
+            self.n_bins,
+            self.KERNEL_SIZE,
+            padding=self.KERNEL_SIZE // 2,
+            padding_mode="reflect",
+        )
+        self.input_proj = nn.Conv2d(5, self.channels, 1, bias=False)
+        self.input_norm = WavehaxLayerNorm2d(self.channels)
+        self.blocks = nn.ModuleList(
+            [
+                WavehaxConvNeXtBlock2d(
+                    self.channels,
+                    self.hidden_channels // self.channels,
+                    self.KERNEL_SIZE,
+                    self.KERNEL_SIZE,
+                    layer_scale=1.0 / float(self.block_count),
+                )
+                for _ in range(self.block_count)
+            ]
+        )
+        self.output_norm = WavehaxLayerNorm2d(self.channels)
+        self.output_proj = nn.Conv2d(self.channels, 2, 1)
+        self.register_buffer("window", torch.hann_window(self.n_fft), persistent=False)
+        self.apply(self._initialize_weights)
+
+    @staticmethod
+    def _initialize_weights(module: nn.Module) -> None:
+        if isinstance(module, (nn.Conv1d, nn.Conv2d)):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def _harmonic_prior(self, latent: torch.Tensor) -> torch.Tensor:
+        """generate_pcph_closed_form port: pseudo-constant-power harmonic
+        waveform via the Dirichlet-kernel closed form, [batch, 1, samples]."""
+        frames = int(latent.shape[-1])
+        total_samples = frames * HOP_LENGTH
+        log_f0 = latent[:, self.f0_channel : self.f0_channel + 1]
+        voiced = (latent[:, self.voiced_channel : self.voiced_channel + 1] > 0.5).to(dtype=torch.float32)
+        f0 = torch.exp(log_f0.float().clamp(math.log(50.0), math.log(800.0))) * voiced
+        f0 = F.interpolate(f0, size=total_samples, mode="linear", align_corners=False)
+
+        phase_increment = f0 / float(self.sample_rate)
+        if self.training:
+            initial_phase = torch.rand((latent.shape[0], 1, 1), device=latent.device, dtype=torch.float32)
+            phase_increment = torch.cat(
+                [phase_increment[..., :1] + initial_phase, phase_increment[..., 1:]],
+                dim=-1,
+            )
+        phase = torch.cumsum(phase_increment, dim=-1)
+        phase = torch.remainder(phase, 1.0) * (2.0 * math.pi)
+
+        vuv = (f0 > 0.0).to(dtype=torch.float32)
+        safe_f0 = f0.clamp_min(1.0)
+        harmonic_count = torch.floor((float(self.sample_rate) / 2.0) / safe_f0).clamp_min(1.0)
+        half_phase = 0.5 * phase
+        denominator = 2.0 * torch.sin(half_phase)
+        numerator = torch.cos(half_phase) - torch.cos((harmonic_count + 0.5) * phase)
+        valid = denominator.abs() > 1e-6
+        safe_denominator = torch.where(valid, denominator, torch.ones_like(denominator))
+        harmonics = torch.where(valid, numerator / safe_denominator, torch.zeros_like(numerator))
+        amplitude = self.PRIOR_POWER * torch.sqrt(2.0 / harmonic_count)
+        prior = harmonics * amplitude * vuv
+
+        if self.training:
+            noise = torch.randn_like(prior)
+        else:
+            index = torch.arange(total_samples, device=latent.device, dtype=torch.float32)
+            hashed = torch.sin((index + 1.0) * 12.9898) * 43758.5453
+            noise = ((hashed - torch.floor(hashed)) * 2.0 - 1.0) * math.sqrt(3.0)
+            noise = noise.view(1, 1, -1).expand_as(prior)
+        prior = prior + self.PRIOR_NOISE * noise
+        return prior.to(dtype=latent.dtype)
+
+    def _stft(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Official Wavehax STFT framing: pad (n_fft - hop) split evenly so
+        frames*hop samples yield exactly `frames` spectral frames."""
+        pad_total = self.n_fft - HOP_LENGTH
+        padded = F.pad(audio, (pad_total // 2, pad_total - pad_total // 2))
+        frames = padded.squeeze(1).unfold(-1, self.n_fft, HOP_LENGTH)
+        frames = frames * self.window.to(device=audio.device, dtype=audio.dtype).view(1, 1, -1)
+        spectrum = torch.fft.rfft(frames.float(), n=self.n_fft, dim=-1)
+        spectrum = spectrum.transpose(1, 2)
+        return spectrum.real.to(dtype=audio.dtype), spectrum.imag.to(dtype=audio.dtype)
+
+    def _istft(self, real: torch.Tensor, imag: torch.Tensor) -> torch.Tensor:
+        """Official Wavehax inverse: irfft, window, overlap-add, then divide by
+        the fold-summed squared-window envelope; output is frames * hop."""
+        if real.shape != imag.shape or real.ndim != 3 or int(real.shape[1]) != self.n_bins:
+            raise RuntimeError(
+                f"wavehax_faithful complex spectrum shape mismatch: real={real.shape}, imag={imag.shape}"
+            )
+        frame_count = int(real.shape[-1])
+        spectrum = torch.complex(real.float(), imag.float()).transpose(1, 2)
+        frames = torch.fft.irfft(spectrum, n=self.n_fft, dim=-1)
+        window = self.window.to(device=real.device, dtype=frames.dtype)
+        frames = frames * window.view(1, 1, -1)
+        fold_input = frames.transpose(1, 2)
+        full_length = (frame_count - 1) * HOP_LENGTH + self.n_fft
+        audio = F.fold(
+            fold_input,
+            output_size=(1, full_length),
+            kernel_size=(1, self.n_fft),
+            stride=(1, HOP_LENGTH),
+        ).reshape(real.shape[0], 1, full_length)
+        envelope_frames = window.square().view(1, self.n_fft, 1).expand(real.shape[0], -1, frame_count)
+        envelope = F.fold(
+            envelope_frames,
+            output_size=(1, full_length),
+            kernel_size=(1, self.n_fft),
+            stride=(1, HOP_LENGTH),
+        ).reshape(real.shape[0], 1, full_length)
+        pad_left = (self.n_fft - HOP_LENGTH) // 2
+        samples = frame_count * HOP_LENGTH
+        audio = audio[..., pad_left : pad_left + samples]
+        envelope = envelope[..., pad_left : pad_left + samples]
+        return (audio / envelope.clamp_min(1e-7)).to(dtype=real.dtype)
+
+    def forward(
+        self,
+        latent: torch.Tensor,
+        *,
+        return_features: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if latent.ndim != 3:
+            raise RuntimeError(f"expected latent [batch, channels, frames], got {latent.shape}")
+        if int(latent.shape[1]) != self.in_channels:
+            raise RuntimeError(
+                f"wavehax_faithful expected {self.in_channels} input channels, got {latent.shape[1]}"
+            )
+        with torch.no_grad():
+            prior = self._harmonic_prior(latent)
+            prior_real, prior_imag = self._stft(prior)
+        prior_real_proj = self.prior_proj(prior_real)
+        prior_imag_proj = self.prior_proj(prior_imag)
+        condition = self.cond_proj(latent)
+        x = torch.stack(
+            [prior_real, prior_imag, prior_real_proj, prior_imag_proj, condition],
+            dim=1,
+        )
+        x = self.input_norm(self.input_proj(x))
+        features: dict[str, torch.Tensor] = {"pre": x}
+        for index, block in enumerate(self.blocks):
+            x = block(x)
+            features[f"whx_block{index}"] = x
+        features["stage0_mix"] = x
+        complex_params = self.output_proj(self.output_norm(x))
+        real, imag = complex_params[:, 0], complex_params[:, 1]
+        audio = self._istft(real, imag)
+        features["pre_tanh"] = complex_params.flatten(1, 2)
+        features["whx_prior"] = prior
+        features["audio_pre_filter"] = audio
+        features["audio"] = audio
+        if return_features:
+            return audio, features
+        return audio
+
+
+def _hift_get_padding(kernel_size: int, dilation: int) -> int:
+    """Same-length padding for an odd kernel at a given dilation.
+
+    https://github.com/yl4579/StyleTTS2/blob/main/Modules/utils.py (get_padding)
+    """
+    return int((kernel_size * dilation - dilation) / 2)
+
+
+class HiftAdaIN1d(nn.Module):
+    """AdaIN1d port from StyleTTS2/Kokoro istftnet.py: instance-normalizes x,
+    then applies a per-channel affine (gamma, beta) predicted from a style
+    vector.
+
+    Inherited constraint: nn.InstanceNorm1d(affine=False) computes per-sample
+    statistics over the time axis (no running stats), so it requires more
+    than one temporal element per forward call in training mode. hiftlite's
+    body therefore needs crop_frames/frames >= 2; this matches the reference
+    architecture rather than being a hiftlite-specific limitation.
+    https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
+    """
+
+    def __init__(self, style_dim: int, channels: int) -> None:
+        super().__init__()
+        if style_dim <= 0:
+            raise ValueError(f"style_dim must be positive, got {style_dim}")
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}")
+        self.norm = nn.InstanceNorm1d(channels, affine=False)
+        self.fc = nn.Linear(style_dim, channels * 2)
+
+    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise RuntimeError(f"expected AdaIN input [batch, channels, time], got {x.shape}")
+        if style.ndim != 2:
+            raise RuntimeError(f"expected AdaIN style [batch, style_dim], got {style.shape}")
+        h = self.fc(style).unsqueeze(-1)
+        gamma, beta = h.chunk(2, dim=1)
+        return (1.0 + gamma) * self.norm(x) + beta
+
+
+class HiftAdainResBlk1d(nn.Module):
+    """AdainResBlk1d port from StyleTTS2/Kokoro istftnet.py, restricted to the
+    upsample='none' path.
+
+    The reference module also supports an internal 2x nearest-neighbor
+    upsample path (upsample=True) for interleaving upsampling with
+    style-conditioned residual blocks. hiftlite does all of its upsampling
+    with the explicit ConvTranspose1d stages in HiftGenerator instead, so
+    only the no-upsample residual path is ported here.
+    https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
+    """
+
+    def __init__(self, dim_in: int, dim_out: int, style_dim: int) -> None:
+        super().__init__()
+        if dim_in <= 0 or dim_out <= 0:
+            raise ValueError(f"dim_in/dim_out must be positive, got {(dim_in, dim_out)}")
+        self.norm1 = HiftAdaIN1d(style_dim, dim_in)
+        self.norm2 = HiftAdaIN1d(style_dim, dim_out)
+        self.conv1 = weight_norm(nn.Conv1d(dim_in, dim_out, 3, padding=1))
+        self.conv2 = weight_norm(nn.Conv1d(dim_out, dim_out, 3, padding=1))
+        self.learned_shortcut = dim_in != dim_out
+        if self.learned_shortcut:
+            self.conv1x1 = weight_norm(nn.Conv1d(dim_in, dim_out, 1, bias=False))
+
+    def _shortcut(self, x: torch.Tensor) -> torch.Tensor:
+        if self.learned_shortcut:
+            return self.conv1x1(x)
+        return x
+
+    def _residual(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        x = self.norm1(x, style)
+        x = F.leaky_relu(x, 0.2)
+        x = self.conv1(x)
+        x = self.norm2(x, style)
+        x = F.leaky_relu(x, 0.2)
+        x = self.conv2(x)
+        return x
+
+    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        out = self._residual(x, style) + self._shortcut(x)
+        return out * (1.0 / math.sqrt(2.0))
+
+
+class HiftSineGen(nn.Module):
+    """SineGen port from StyleTTS2/Kokoro istftnet.py.
+
+    Generates a bank of harmonic sine waveforms (fundamental + overtones)
+    directly at audio sample rate from an audio-rate F0 curve, using the
+    reference's downsample-cumsum-upsample trick to keep the phase
+    accumulation numerically stable at long lengths. Tensors here are
+    channels-last ([batch, samples, dim]), matching the reference and the
+    SourceModuleHnNSF/nn.Linear mixing that follows it.
+    https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
+    """
+
+    def __init__(
+        self,
+        sample_rate: int,
+        upsample_scale: int,
+        harmonic_num: int = 0,
+        sine_amp: float = 0.1,
+        noise_std: float = 0.003,
+        voiced_threshold: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if sample_rate <= 0:
+            raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+        if upsample_scale <= 0:
+            raise ValueError(f"upsample_scale must be positive, got {upsample_scale}")
+        if harmonic_num < 0:
+            raise ValueError(f"harmonic_num must be non-negative, got {harmonic_num}")
+        self.sample_rate = int(sample_rate)
+        self.upsample_scale = int(upsample_scale)
+        self.harmonic_num = int(harmonic_num)
+        self.dim = self.harmonic_num + 1
+        self.sine_amp = float(sine_amp)
+        self.noise_std = float(noise_std)
+        self.voiced_threshold = float(voiced_threshold)
+        self.register_buffer(
+            "harmonic_index",
+            torch.arange(1, self.dim + 1, dtype=torch.float32).view(1, 1, -1),
+            persistent=False,
+        )
+
+    def _voiced_mask(self, f0: torch.Tensor) -> torch.Tensor:
+        return (f0 > self.voiced_threshold).to(dtype=f0.dtype)
+
+    def forward(self, f0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """f0: [batch, samples, 1] in Hz (0 for unvoiced), at audio sample rate."""
+        if f0.ndim != 3 or f0.shape[-1] != 1:
+            raise RuntimeError(f"expected f0 [batch, samples, 1], got {f0.shape}")
+        harmonic_index = self.harmonic_index.to(device=f0.device, dtype=f0.dtype)
+        harmonics = f0 * harmonic_index  # [batch, samples, dim]
+        rad = (harmonics / float(self.sample_rate)) % 1.0
+
+        # Deliberate deviation from the literal reference: the reference always
+        # draws a fresh per-harmonic initial phase offset (torch.rand) and a
+        # fresh additive noise term (torch.randn_like) on every call, even in
+        # eval() mode, so repeated inference calls are never bit-identical.
+        # hiftlite needs deterministic eval-mode forward passes for
+        # reproducible probe/eval renders, so both are gated on self.training
+        # and become exactly zero at eval time. The stochastic excitation is
+        # kept in full during training.
+        if self.training:
+            rand_init = torch.rand(rad.shape[0], rad.shape[2], device=rad.device, dtype=rad.dtype)
+            rand_init = rand_init.clone()
+            rand_init[:, 0] = 0.0
+        else:
+            rand_init = torch.zeros(rad.shape[0], rad.shape[2], device=rad.device, dtype=rad.dtype)
+        rad = rad.clone()
+        rad[:, 0, :] = rad[:, 0, :] + rand_init
+
+        rad_ds = F.interpolate(
+            rad.transpose(1, 2),
+            scale_factor=1.0 / self.upsample_scale,
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2)
+        phase_ds = torch.cumsum(rad_ds, dim=1) * (2.0 * math.pi)
+        phase = F.interpolate(
+            phase_ds.transpose(1, 2) * self.upsample_scale,
+            scale_factor=self.upsample_scale,
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2)
+        sines = torch.sin(phase) * self.sine_amp
+
+        uv = self._voiced_mask(f0)
+        noise_amp = uv * self.noise_std + (1.0 - uv) * (self.sine_amp / 3.0)
+        if self.training:
+            noise = noise_amp * torch.randn_like(sines)
+        else:
+            noise = torch.zeros_like(sines)
+        sine_waves = sines * uv + noise
+        return sine_waves, uv
+
+
+class HiftSourceModuleHnNSF(nn.Module):
+    """SourceModuleHnNSF port from StyleTTS2/Kokoro istftnet.py: turns the
+    harmonic sine bank into a single merged excitation signal via a small
+    linear mix + tanh.
+    https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
+    https://github.com/hexgrad/kokoro (kokoro/istftnet.py)
+
+    In both reference implementations, every caller of this module (the
+    generator's forward) wraps the entire call in `with torch.no_grad()`, so
+    `l_linear`/`l_tanh` never receive a gradient in practice: the excitation
+    is treated as a fixed physical signal, not something the waveform loss
+    should reshape. hiftlite makes that explicit by freezing `l_linear`
+    (`requires_grad=False`) instead of leaving a nominally-trainable layer
+    that silently never updates.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int,
+        upsample_scale: int,
+        harmonic_num: int = 8,
+        sine_amp: float = 0.1,
+        noise_std: float = 0.003,
+        voiced_threshold: float = 10.0,
+    ) -> None:
+        super().__init__()
+        self.sine_gen = HiftSineGen(
+            sample_rate,
+            upsample_scale,
+            harmonic_num=harmonic_num,
+            sine_amp=sine_amp,
+            noise_std=noise_std,
+            voiced_threshold=voiced_threshold,
+        )
+        self.l_linear = nn.Linear(harmonic_num + 1, 1)
+        for parameter in self.l_linear.parameters():
+            parameter.requires_grad_(False)
+        self.l_tanh = nn.Tanh()
+
+    def forward(self, f0: torch.Tensor) -> torch.Tensor:
+        """f0: [batch, samples, 1] in Hz. Returns the merged excitation, same shape."""
+        with torch.no_grad():
+            sine_waves, _uv = self.sine_gen(f0)
+            merged = self.l_tanh(self.l_linear(sine_waves))
+        return merged
+
+
+class HiftMRFResBlock(nn.Module):
+    """Multi-receptive-field residual block for the hiftlite generator.
+
+    Structurally this is the same {kernel, dilation} branch pattern as
+    AdaINResBlock1 in StyleTTS2/Kokoro istftnet.py (one branch per kernel
+    size, three dilated convs per branch, summed/averaged across branches in
+    HiftGenerator), but it is intentionally lighter: a single conv per
+    dilation (HiFi-GAN "ResBlock2" style) rather than AdaINResBlock1's two
+    convs per dilation, and this file's plain (non-style-conditioned)
+    SnakeActivation rather than AdaINResBlock1's per-branch AdaIN-modulated
+    Snake. The body's AdainResBlk1d blocks already carry the (constant)
+    style signal; re-applying AdaIN inside every MRF branch here would mostly
+    just re-scale the same constant vector while roughly doubling this
+    block's parameter count, which is what keeps hiftlite inside its ~2M
+    parameter target.
+    https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
+    """
+
+    def __init__(self, channels: int, kernel_size: int, dilations: tuple[int, int, int] = (1, 3, 5)) -> None:
+        super().__init__()
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(f"kernel_size must be a positive odd integer, got {kernel_size}")
+        if len(dilations) != 3:
+            raise ValueError(f"expected exactly 3 dilations, got {dilations}")
+        self.convs = nn.ModuleList(
+            [
+                weight_norm(
+                    nn.Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        dilation=dilation,
+                        padding=_hift_get_padding(kernel_size, dilation),
+                    )
+                )
+                for dilation in dilations
+            ]
+        )
+        self.acts = nn.ModuleList([SnakeActivation(channels) for _ in dilations])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for conv, act in zip(self.convs, self.acts):
+            x = x + conv(act(x))
+        return x
+
+
+class HiftGenerator(nn.Module):
+    """Narrowed HiFTNet/iSTFTNet generator: ConvTranspose1d upsampling stages
+    with NSF harmonic-source noise injection at each stage, MRF resblocks,
+    and an iSTFT synthesis head.
+    Ported (with the MRF simplification documented on HiftMRFResBlock) from
+    the Generator class in StyleTTS2/Kokoro istftnet.py:
+    https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        gen_channels: int,
+        upsample_rates: tuple[int, ...] = (4, 4),
+        upsample_kernel_sizes: tuple[int, ...] = (8, 8),
+        resblock_kernel_sizes: tuple[int, ...] = (3, 7),
+        resblock_dilations: tuple[int, int, int] = (1, 3, 5),
+        istft_n_fft: int = 64,
+        istft_hop: int = 16,
+    ) -> None:
+        super().__init__()
+        if len(upsample_rates) != len(upsample_kernel_sizes):
+            raise ValueError("upsample_rates and upsample_kernel_sizes must have the same length")
+        if gen_channels % (2 ** len(upsample_rates)) != 0:
+            raise ValueError(
+                f"gen_channels {gen_channels} must be divisible by 2**{len(upsample_rates)} "
+                "(each upsample stage halves the channel width)"
+            )
+        if istft_n_fft <= 0 or istft_n_fft % 2 != 0:
+            raise ValueError(f"istft_n_fft must be a positive even integer, got {istft_n_fft}")
+        if istft_hop <= 0:
+            raise ValueError(f"istft_hop must be positive, got {istft_hop}")
+        total_upsample = 1
+        for rate in upsample_rates:
+            total_upsample *= int(rate)
+        total_upsample *= int(istft_hop)
+        if total_upsample != HOP_LENGTH:
+            raise ValueError(
+                f"hiftlite upsample_rates {upsample_rates} * istft_hop {istft_hop} = {total_upsample}, "
+                f"must equal HOP_LENGTH={HOP_LENGTH}"
+            )
+        self.num_upsamples = len(upsample_rates)
+        self.num_kernels = len(resblock_kernel_sizes)
+        self.istft_n_fft = int(istft_n_fft)
+        self.istft_hop = int(istft_hop)
+        self.total_upsample = int(total_upsample)
+
+        self.conv_pre = nn.Conv1d(in_channels, gen_channels, 7, padding=3)
+
+        stage_channels: list[int] = []
+        channels = gen_channels
+        for _ in upsample_rates:
+            channels = channels // 2
+            stage_channels.append(channels)
+
+        self.pre_up_acts = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        in_ch = gen_channels
+        for stage_ch, (rate, kernel) in zip(stage_channels, zip(upsample_rates, upsample_kernel_sizes)):
+            self.pre_up_acts.append(SnakeActivation(in_ch))
+            self.ups.append(
+                weight_norm(
+                    nn.ConvTranspose1d(in_ch, stage_ch, kernel, stride=rate, padding=(kernel - rate) // 2)
+                )
+            )
+            in_ch = stage_ch
+
+        self.resblocks = nn.ModuleList(
+            [
+                HiftMRFResBlock(stage_ch, kernel, resblock_dilations)
+                for stage_ch in stage_channels
+                for kernel in resblock_kernel_sizes
+            ]
+        )
+
+        source_bins = self.istft_n_fft + 2
+        self.noise_convs = nn.ModuleList()
+        for index, stage_ch in enumerate(stage_channels):
+            if index + 1 < len(upsample_rates):
+                stride_f0 = 1
+                for rate in upsample_rates[index + 1 :]:
+                    stride_f0 *= int(rate)
+                self.noise_convs.append(
+                    nn.Conv1d(
+                        source_bins,
+                        stage_ch,
+                        kernel_size=stride_f0 * 2,
+                        stride=stride_f0,
+                        padding=(stride_f0 + 1) // 2,
+                    )
+                )
+            else:
+                self.noise_convs.append(nn.Conv1d(source_bins, stage_ch, kernel_size=1))
+
+        self.post_act = SnakeActivation(stage_channels[-1])
+        self.conv_post = weight_norm(nn.Conv1d(stage_channels[-1], self.istft_n_fft + 2, 7, padding=3))
+        self.reflection_pad = nn.ReflectionPad1d((1, 0))
+        self.register_buffer("istft_window", torch.hann_window(self.istft_n_fft), persistent=False)
+
+    def analyze_source(self, source_wave: torch.Tensor) -> torch.Tensor:
+        """STFT-analyze the harmonic excitation waveform into concatenated
+        magnitude/phase bins, matching Generator.forward's `har` tensor."""
+        window = self.istft_window.to(device=source_wave.device, dtype=torch.float32)
+        spectrum = torch.stft(
+            source_wave.float(),
+            n_fft=self.istft_n_fft,
+            hop_length=self.istft_hop,
+            win_length=self.istft_n_fft,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+        return torch.cat([spectrum.abs(), spectrum.angle()], dim=1).to(dtype=source_wave.dtype)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        har_features: torch.Tensor,
+        *,
+        output_samples: int,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        features: dict[str, torch.Tensor] = {}
+        x = self.conv_pre(x)
+        features["hift_conv_pre"] = x
+        for index in range(self.num_upsamples):
+            x = self.pre_up_acts[index](x)
+            x_source = self.noise_convs[index](har_features)
+            x = self.ups[index](x)
+            if index == self.num_upsamples - 1:
+                x = self.reflection_pad(x)
+            if x.shape[-1] != x_source.shape[-1]:
+                raise RuntimeError(
+                    f"hiftlite stage {index}: upsample length {x.shape[-1]} != "
+                    f"noise-source length {x_source.shape[-1]}"
+                )
+            x = x + x_source
+            stage_sum: torch.Tensor | None = None
+            for kernel_index in range(self.num_kernels):
+                block_out = self.resblocks[index * self.num_kernels + kernel_index](x)
+                stage_sum = block_out if stage_sum is None else stage_sum + block_out
+            x = stage_sum / self.num_kernels
+            features[f"hift_up{index}"] = x
+        x = self.post_act(x)
+        x = self.conv_post(x)
+        bins = self.istft_n_fft // 2 + 1
+        log_magnitude = x[:, :bins, :]
+        phase_logits = x[:, bins:, :]
+        features["pre_tanh"] = x
+        magnitude = torch.exp(log_magnitude.clamp(max=8.0))
+        phase = torch.sin(phase_logits)
+        complex_spec = magnitude.float() * torch.exp(phase.float() * 1j)
+        audio = torch.istft(
+            complex_spec,
+            n_fft=self.istft_n_fft,
+            hop_length=self.istft_hop,
+            win_length=self.istft_n_fft,
+            window=self.istft_window.to(device=x.device, dtype=torch.float32),
+            center=True,
+            length=int(output_samples),
+        ).to(dtype=x.dtype)
+        audio = audio.unsqueeze(1)
+        features["audio_pre_filter"] = audio
+        features["audio"] = audio
+        return audio, features
+
+
+class HiftLiteHead(nn.Module):
+    """Top-level hiftlite decoder head: input projection -> AdainResBlk1d
+    body (constant learned style vector) -> HiftGenerator (NSF source +
+    upsampling MRF stages + iSTFT head).
+
+    See GOAL.md-adjacent probe notes for the full architecture spec. Ports
+    SourceModuleHnNSF/SineGen/AdaIN1d/AdainResBlk1d/Generator from
+    StyleTTS2/Kokoro istftnet.py; the input projection into the body and the
+    constant style vector (in place of a real style encoder, which this
+    decoder-only student does not have) are new plumbing needed to fit that
+    architecture onto an 83-channel acoustic-feature input.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        width: int,
+        gen_channels: int,
+        style_dim: int,
+        body_blocks: int,
+        f0_channel: int,
+        voiced_channel: int,
+        sample_rate: int,
+        harmonic_num: int = 8,
+        sine_amp: float = 0.1,
+        noise_std: float = 0.003,
+        voiced_threshold: float = 10.0,
+        istft_n_fft: int = 64,
+        istft_hop: int = 16,
+    ) -> None:
+        super().__init__()
+        if width <= 0:
+            raise ValueError(f"width must be positive, got {width}")
+        if style_dim <= 0:
+            raise ValueError(f"style_dim must be positive, got {style_dim}")
+        if body_blocks <= 0:
+            raise ValueError(f"body_blocks must be positive, got {body_blocks}")
+        if not (0 <= f0_channel < in_channels) or not (0 <= voiced_channel < in_channels):
+            raise ValueError(
+                f"hiftlite F0/voiced channels {(f0_channel, voiced_channel)} outside input width {in_channels}"
+            )
+        if f0_channel == voiced_channel:
+            raise ValueError("hiftlite F0 and voiced channels must differ")
+        if sample_rate <= 0:
+            raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+        self.f0_channel = int(f0_channel)
+        self.voiced_channel = int(voiced_channel)
+        self.sample_rate = int(sample_rate)
+
+        self.input_proj = nn.Conv1d(in_channels, width, 7, padding=3)
+        self.style = nn.Parameter(torch.zeros(1, style_dim))
+        self.body = nn.ModuleList([HiftAdainResBlk1d(width, width, style_dim) for _ in range(body_blocks)])
+        self.generator = HiftGenerator(
+            in_channels=width,
+            gen_channels=gen_channels,
+            istft_n_fft=istft_n_fft,
+            istft_hop=istft_hop,
+        )
+        self.source_module = HiftSourceModuleHnNSF(
+            sample_rate=sample_rate,
+            upsample_scale=self.generator.total_upsample,
+            harmonic_num=harmonic_num,
+            sine_amp=sine_amp,
+            noise_std=noise_std,
+            voiced_threshold=voiced_threshold,
+        )
+
+    def forward(
+        self,
+        latent: torch.Tensor,
+        *,
+        return_features: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if latent.ndim != 3:
+            raise RuntimeError(f"expected latent [batch, channels, frames], got {latent.shape}")
+        frames = int(latent.shape[-1])
+        features: dict[str, torch.Tensor] = {}
+
+        x = self.input_proj(latent)
+        features["pre"] = x
+        style = self.style.expand(latent.shape[0], -1)
+        for index, block in enumerate(self.body):
+            x = block(x, style)
+            features[f"hift_body{index}"] = x
+        features["stage0_mix"] = x
+
+        with torch.no_grad():
+            log_f0 = latent[:, self.f0_channel : self.f0_channel + 1, :]
+            voiced = latent[:, self.voiced_channel : self.voiced_channel + 1, :].clamp(0.0, 1.0)
+            f0_hz = torch.exp(log_f0.clamp(math.log(50.0), math.log(800.0))) * voiced
+            f0_full = F.interpolate(f0_hz.float(), scale_factor=self.generator.total_upsample, mode="nearest")
+            f0_full = f0_full.transpose(1, 2)  # channels-last [batch, samples, 1]
+            har_source = self.source_module(f0_full)  # [batch, samples, 1]
+            har_wave = har_source.squeeze(-1)
+            har_features = self.generator.analyze_source(har_wave)
+
+        audio, gen_features = self.generator(x, har_features, output_samples=frames * HOP_LENGTH)
+        features.update(gen_features)
+        if return_features:
+            return audio, features
+        return audio
 
 
 class DecoderStudent(nn.Module):
@@ -919,7 +2287,32 @@ class DecoderStudent(nn.Module):
         fsd_blocks: int = 5,
         fsd_film_rank: int = 12,
         fsd_head_rank: int = 48,
+        wavehax_channels: int = 32,
+        wavehax_blocks: int = 8,
+        wavehax_mult_channels: int = 2,
+        wavehax_kernel_freq: int = 7,
+        wavehax_kernel_time: int = 7,
+        wavehax_f0_channel: int = 80,
+        wavehax_voiced_channel: int = 81,
+        wavehax_sample_rate: int = 24000,
+        wavehax_prior_power: float = 0.1,
+        wavehax_prior_noise: float = 0.01,
+        whx_channels: int = 32,
+        whx_hidden: int = 64,
+        whx_blocks: int = 8,
+        whx_n_fft: int = 512,
+        whx_f0_channel: int = 80,
+        whx_voiced_channel: int = 81,
+        whx_sample_rate: int = 24000,
         stage_projection_bottlenecks: tuple[int, ...] = (),
+        istft_tail_head_rank: int = 20,
+        hift_width: int = 224,
+        hift_gen_channels: int = 192,
+        hift_style_dim: int = 64,
+        hift_body_blocks: int = 3,
+        hift_f0_channel: int = 80,
+        hift_voiced_channel: int = 81,
+        hift_sample_rate: int = 24000,
     ) -> None:
         super().__init__()
         if variant not in {
@@ -938,10 +2331,14 @@ class DecoderStudent(nn.Module):
             "apnetlite",
             "fsd",
             "lrc",
+            "wavehax",
+            "wavehax_faithful",
             "pb",
+            "piperlite_istft_tail",
+            "hiftlite",
         }:
             raise ValueError(f"unsupported decoder variant: {variant}")
-        if activation not in {"leaky_relu", "snake"}:
+        if activation not in {"leaky_relu", "snake", "snakebeta_aa"}:
             raise ValueError(f"unsupported decoder activation: {activation}")
         if post_filter_channels < 0:
             raise ValueError(f"post_filter_channels must be non-negative, got {post_filter_channels}")
@@ -1013,10 +2410,35 @@ class DecoderStudent(nn.Module):
         if self.res_bank_scale_mode not in {"kept", "teacher"}:
             raise ValueError(f"res_bank_scale_mode must be 'kept' or 'teacher', got {self.res_bank_scale_mode!r}")
         self.istft_n_fft = int(istft_n_fft)
+        self.istft_tail_head_rank = int(istft_tail_head_rank)
         self.fsd_dim = int(fsd_dim)
         self.fsd_block_count = int(fsd_blocks)
         self.fsd_film_rank = int(fsd_film_rank)
         self.fsd_head_rank = int(fsd_head_rank)
+        self.wavehax_channels = int(wavehax_channels)
+        self.wavehax_block_count = int(wavehax_blocks)
+        self.wavehax_mult_channels = int(wavehax_mult_channels)
+        self.wavehax_kernel_freq = int(wavehax_kernel_freq)
+        self.wavehax_kernel_time = int(wavehax_kernel_time)
+        self.wavehax_f0_channel = int(wavehax_f0_channel)
+        self.wavehax_voiced_channel = int(wavehax_voiced_channel)
+        self.wavehax_sample_rate = int(wavehax_sample_rate)
+        self.wavehax_prior_power = float(wavehax_prior_power)
+        self.wavehax_prior_noise = float(wavehax_prior_noise)
+        self.whx_channels = int(whx_channels)
+        self.whx_hidden = int(whx_hidden)
+        self.whx_block_count = int(whx_blocks)
+        self.whx_n_fft = int(whx_n_fft)
+        self.whx_f0_channel = int(whx_f0_channel)
+        self.whx_voiced_channel = int(whx_voiced_channel)
+        self.whx_sample_rate = int(whx_sample_rate)
+        self.hift_width = int(hift_width)
+        self.hift_gen_channels = int(hift_gen_channels)
+        self.hift_style_dim = int(hift_style_dim)
+        self.hift_body_blocks = int(hift_body_blocks)
+        self.hift_f0_channel = int(hift_f0_channel)
+        self.hift_voiced_channel = int(hift_voiced_channel)
+        self.hift_sample_rate = int(hift_sample_rate)
         expected_channel_count = 5 if variant == "piperlite4" else 4
         if len(channels) != expected_channel_count:
             raise ValueError(
@@ -1028,9 +2450,132 @@ class DecoderStudent(nn.Module):
             raise ValueError("--factorized-pre-rank currently supports --variant piperlite/pb only")
         if self.piper_res_factor_rank_ratio > 0.0 and variant not in {"piperlite", "piperlite4", "pb"}:
             raise ValueError("--piper-res-factor-rank-ratio currently supports --variant piperlite/piperlite4/pb only")
-        if variant in {"istft", "apnetlite", "fsd", "lrc"}:
+        if variant in {"istft", "apnetlite", "fsd", "lrc", "wavehax", "piperlite_istft_tail"}:
             if self.istft_n_fft <= 0 or self.istft_n_fft % 2 != 0:
                 raise ValueError(f"istft_n_fft must be a positive even integer, got {self.istft_n_fft}")
+        if variant == "piperlite_istft_tail" and self.istft_tail_head_rank <= 0:
+            raise ValueError(f"istft_tail_head_rank must be positive, got {self.istft_tail_head_rank}")
+        if variant == "wavehax":
+            self.wavehax_head = KokoroWavehaxHead(
+                in_channels=in_channels,
+                n_fft=self.istft_n_fft,
+                sample_rate=self.wavehax_sample_rate,
+                channels=self.wavehax_channels,
+                blocks=self.wavehax_block_count,
+                mult_channels=self.wavehax_mult_channels,
+                kernel_freq=self.wavehax_kernel_freq,
+                kernel_time=self.wavehax_kernel_time,
+                f0_channel=self.wavehax_f0_channel,
+                voiced_channel=self.wavehax_voiced_channel,
+                prior_power=self.wavehax_prior_power,
+                prior_noise=self.wavehax_prior_noise,
+            )
+            self.pre = nn.Identity()
+            self.pre_affine = nn.Identity()
+            self.stage0_affine = nn.Identity()
+            self.stage1_affine = nn.Identity()
+            self.stage2_affine = nn.Identity()
+            self.stage3_affine = nn.Identity()
+            self.act_pre = nn.Identity()
+            self.up0 = None
+            self.act_up0 = nn.Identity()
+            self.up1 = None
+            self.act_up1 = nn.Identity()
+            self.up2 = None
+            self.act_up2 = nn.Identity()
+            self.up3 = None
+            self.res0 = nn.Identity()
+            self.res1 = nn.Identity()
+            self.res2 = None
+            self.res3 = None
+            self.act_post = nn.Identity()
+            self.post = nn.Identity()
+            self.amp_head = None
+            self.phase_head = None
+            self.pre_tanh_repair = nn.Identity()
+            self.post_filter = nn.Identity()
+            self.stage0_projection = nn.Identity()
+            self.stage1_projection = nn.Identity()
+            self.stage2_projection = nn.Identity()
+            return
+        if variant == "wavehax_faithful":
+            self.whx_head = WavehaxFaithfulHead(
+                in_channels=in_channels,
+                channels=self.whx_channels,
+                hidden_channels=self.whx_hidden,
+                blocks=self.whx_block_count,
+                n_fft=self.whx_n_fft,
+                f0_channel=self.whx_f0_channel,
+                voiced_channel=self.whx_voiced_channel,
+                sample_rate=self.whx_sample_rate,
+            )
+            self.pre = nn.Identity()
+            self.pre_affine = nn.Identity()
+            self.stage0_affine = nn.Identity()
+            self.stage1_affine = nn.Identity()
+            self.stage2_affine = nn.Identity()
+            self.stage3_affine = nn.Identity()
+            self.act_pre = nn.Identity()
+            self.up0 = None
+            self.act_up0 = nn.Identity()
+            self.up1 = None
+            self.act_up1 = nn.Identity()
+            self.up2 = None
+            self.act_up2 = nn.Identity()
+            self.up3 = None
+            self.res0 = nn.Identity()
+            self.res1 = nn.Identity()
+            self.res2 = None
+            self.res3 = None
+            self.act_post = nn.Identity()
+            self.post = nn.Identity()
+            self.amp_head = None
+            self.phase_head = None
+            self.pre_tanh_repair = nn.Identity()
+            self.post_filter = nn.Identity()
+            self.stage0_projection = nn.Identity()
+            self.stage1_projection = nn.Identity()
+            self.stage2_projection = nn.Identity()
+            return
+        if variant == "hiftlite":
+            self.hift_head = HiftLiteHead(
+                in_channels=in_channels,
+                width=self.hift_width,
+                gen_channels=self.hift_gen_channels,
+                style_dim=self.hift_style_dim,
+                body_blocks=self.hift_body_blocks,
+                f0_channel=self.hift_f0_channel,
+                voiced_channel=self.hift_voiced_channel,
+                sample_rate=self.hift_sample_rate,
+            )
+            self.pre = nn.Identity()
+            self.pre_affine = nn.Identity()
+            self.stage0_affine = nn.Identity()
+            self.stage1_affine = nn.Identity()
+            self.stage2_affine = nn.Identity()
+            self.stage3_affine = nn.Identity()
+            self.act_pre = nn.Identity()
+            self.up0 = None
+            self.act_up0 = nn.Identity()
+            self.up1 = None
+            self.act_up1 = nn.Identity()
+            self.up2 = None
+            self.act_up2 = nn.Identity()
+            self.up3 = None
+            self.res0 = nn.Identity()
+            self.res1 = nn.Identity()
+            self.res2 = None
+            self.res3 = None
+            self.act_post = nn.Identity()
+            self.post = nn.Identity()
+            self.amp_head = None
+            self.phase_head = None
+            self.pre_tanh_repair = nn.Identity()
+            self.post_filter = nn.Identity()
+            self.stage0_projection = nn.Identity()
+            self.stage1_projection = nn.Identity()
+            self.stage2_projection = nn.Identity()
+            return
         if variant in {"fsd", "lrc"}:
             if self.fsd_dim <= 0:
                 raise ValueError(f"fsd_dim must be positive, got {self.fsd_dim}")
@@ -1111,6 +2656,81 @@ class DecoderStudent(nn.Module):
             self.res2 = None
             self.up3 = None
             self.res3 = None
+            self.stage0_projection = nn.Identity()
+            self.stage1_projection = nn.Identity()
+            self.stage2_projection = nn.Identity()
+            self.pre_tanh_repair = nn.Identity()
+            self.post_filter = nn.Identity()
+            return
+        if variant == "piperlite_istft_tail":
+            # Keep the piperlite body (pre -> up0/res0 -> up1/res1) exactly as trained by
+            # the full piperlite student, so a joint-buzzkill checkpoint can be grafted in
+            # by tensor name/shape (see tools/istft_tail_graft.py). up0 and up1 are each
+            # verified stride-8 ConvTranspose1d stages (kernel 16, stride 8, padding 4), so
+            # the body output here runs at up0.stride * up1.stride = 8*8 = 64x the input
+            # latent-frame resolution -- NOT the 16x/1500Hz figure floated when this variant
+            # was scoped; that arithmetic assumed a stride split this codebase does not use.
+            # Replace the checkerboard-prone up2/res2/post transposed-conv tail with a
+            # depthwise pooling conv (stride = up0*up1 factor) that condenses back down to
+            # one feature vector per original latent frame, followed by a compact factorized
+            # log-magnitude/phase head synthesized via torch.istft (see logmag_phase_synthesize
+            # in src/saanotts/models/fsd.py).
+            self.pre = nn.Conv1d(in_channels, c0, 7, padding=3)
+            self.pre_affine = ChannelAffine1d(c0) if stage_affine else nn.Identity()
+            self.stage0_affine = ChannelAffine1d(c1) if stage_affine else nn.Identity()
+            self.stage1_affine = ChannelAffine1d(c2) if stage_affine else nn.Identity()
+            self.stage2_affine = nn.Identity()
+            self.stage3_affine = nn.Identity()
+            self.act_pre = make_activation(activation, c0)
+            self.up0 = self._make_upsample(c0, c1, 16, 8, 4, "piperlite", rank_ratio)
+            self.act_up0 = make_activation(activation, c1)
+            self.res0 = self._make_res_stack(
+                c1,
+                res_layers,
+                "piperlite",
+                activation,
+                piper_branch_indices=self.stage0_branches,
+                piper_res_factor_rank_ratio=self.piper_res_factor_rank_ratio,
+                res_bank_scale_mode=self.res_bank_scale_mode,
+            )
+            self.up1 = self._make_upsample(c1, c2, 16, 8, 4, "piperlite", rank_ratio)
+            self.act_up1 = make_activation(activation, c2)
+            self.res1 = self._make_res_stack(
+                c2,
+                res_layers,
+                "piperlite",
+                activation,
+                piper_branch_indices=self.stage1_branches,
+                piper_res_factor_rank_ratio=self.piper_res_factor_rank_ratio,
+                res_bank_scale_mode=self.res_bank_scale_mode,
+            )
+            pool_stride = int(self.up0.stride[0]) * int(self.up1.stride[0])
+            if pool_stride <= 0:
+                raise RuntimeError(f"internal error: non-positive istft-tail pool stride {pool_stride}")
+            self.istft_tail_pool_stride = pool_stride
+            self.istft_tail_pool = nn.Conv1d(
+                c2,
+                c2,
+                kernel_size=2 * pool_stride,
+                stride=pool_stride,
+                padding=pool_stride // 2,
+                groups=c2,
+            )
+            self.istft_tail_head = FactorizedSpectralHead(
+                in_channels=c2,
+                rank=self.istft_tail_head_rank,
+                n_fft=self.istft_n_fft,
+            )
+            self.register_buffer("istft_window", torch.hann_window(self.istft_n_fft), persistent=False)
+            self.up2 = None
+            self.res2 = None
+            self.up3 = None
+            self.res3 = None
+            self.act_up2 = nn.Identity()
+            self.act_post = nn.Identity()
+            self.post = nn.Identity()
+            self.amp_head = None
+            self.phase_head = None
             self.stage0_projection = nn.Identity()
             self.stage1_projection = nn.Identity()
             self.stage2_projection = nn.Identity()
@@ -1438,6 +3058,12 @@ class DecoderStudent(nn.Module):
     def forward(self, latent: torch.Tensor, return_features: bool = False) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if latent.ndim != 3:
             raise RuntimeError(f"expected latent [batch, channels, frames], got {latent.shape}")
+        if self.variant == "wavehax":
+            return self.wavehax_head(latent, return_features=return_features)
+        if self.variant == "wavehax_faithful":
+            return self.whx_head(latent, return_features=return_features)
+        if self.variant == "hiftlite":
+            return self.hift_head(latent, return_features=return_features)
         features: dict[str, torch.Tensor] = {}
         x = self.pre_affine(self.pre(latent))
         features["pre"] = x
@@ -1475,6 +3101,32 @@ class DecoderStudent(nn.Module):
                 audio, ap_features = self._apnetlite_synthesize(amp_logits, phase_logits, int(latent.shape[-1]))
                 features["pre_tanh"] = torch.cat([amp_logits, phase_logits], dim=1)
                 features.update(ap_features)
+            features["audio_pre_filter"] = audio
+            features["audio"] = audio
+            if return_features:
+                return audio, features
+            return audio
+        if self.variant == "piperlite_istft_tail":
+            x = self.up0(self.act_pre(x))
+            features["up0_raw"] = x
+            features["up0"] = x
+            x = self.stage0_affine(self.res0(x))
+            features["stage0_mix"] = x
+            x = self.up1(self.act_up0(x))
+            features["up1_raw"] = x
+            features["up1"] = x
+            x = self.stage1_affine(self.res1(x))
+            features["stage1_mix"] = x
+            pooled = self.istft_tail_pool(self.act_up1(x))
+            if pooled.shape[-1] != int(latent.shape[-1]):
+                raise RuntimeError(
+                    f"istft-tail pooled frame count {pooled.shape[-1]} != latent frames {int(latent.shape[-1])}"
+                )
+            features["istft_tail_pooled"] = pooled
+            log_magnitude, phase_logits, head_params = self.istft_tail_head(pooled)
+            audio, ap_features = self._logmag_phase_synthesize(log_magnitude, phase_logits, int(latent.shape[-1]))
+            features["pre_tanh"] = head_params
+            features.update(ap_features)
             features["audio_pre_filter"] = audio
             features["audio"] = audio
             if return_features:
@@ -1541,8 +3193,10 @@ def initialize_spectral_heads(
         return None
     if mode not in {"zero", "small"}:
         raise ValueError(f"unsupported spectral head init mode: {mode}")
-    if model.variant not in {"istft", "apnetlite", "fsd", "lrc"}:
-        raise RuntimeError(f"--spectral-head-init {mode} requires --variant istft, apnetlite, fsd, or lrc")
+    if model.variant not in {"istft", "apnetlite", "fsd", "lrc", "piperlite_istft_tail"}:
+        raise RuntimeError(
+            f"--spectral-head-init {mode} requires --variant istft, apnetlite, fsd, lrc, or piperlite_istft_tail"
+        )
     if scale <= 0.0:
         raise ValueError(f"spectral head init scale must be positive, got {scale}")
 
@@ -1555,6 +3209,16 @@ def initialize_spectral_heads(
             nn.init.constant_(conv.bias, bias)
 
     with torch.no_grad():
+        if model.variant == "piperlite_istft_tail":
+            if not isinstance(model.istft_tail_head, FactorizedSpectralHead):
+                raise RuntimeError("piperlite_istft_tail spectral head init expected a FactorizedSpectralHead")
+            return initialize_factorized_spectral_head(
+                model.istft_tail_head,
+                mode=mode,
+                scale=scale,
+                amp_bias=ap_amp_bias,
+                phase_real_bias=ap_phase_real_bias,
+            )
         if model.variant == "istft":
             if not isinstance(model.post, nn.Conv1d):
                 raise RuntimeError("iSTFT spectral head init expected model.post to be Conv1d")
@@ -1684,12 +3348,16 @@ def parse_args() -> argparse.Namespace:
             "apnetlite",
             "fsd",
             "lrc",
+            "wavehax",
+            "wavehax_faithful",
             "pb",
+            "piperlite_istft_tail",
+            "hiftlite",
         ),
         default="dense",
     )
     parser.add_argument("--rank-ratio", type=float, default=0.5)
-    parser.add_argument("--activation", choices=("leaky_relu", "snake"), default="leaky_relu")
+    parser.add_argument("--activation", choices=("leaky_relu", "snake", "snakebeta_aa"), default="leaky_relu")
     parser.add_argument("--res-layers", type=int, default=1)
     parser.add_argument(
         "--stage-affine",
@@ -1733,6 +3401,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fsd-blocks", type=int, default=5)
     parser.add_argument("--fsd-film-rank", type=int, default=12)
     parser.add_argument("--fsd-head-rank", type=int, default=48)
+    parser.add_argument(
+        "--istft-tail-head-rank",
+        type=int,
+        default=20,
+        help=(
+            "For --variant piperlite_istft_tail, rank of the factorized log-magnitude/phase "
+            "head (in_proj/out_proj 1x1 convs) applied after the depthwise pooling conv. "
+            "Default 20 keeps the new head's parameter count (pool conv + head) below the "
+            "up2/res2/post tail it replaces at channels 256,128,64,32."
+        ),
+    )
     parser.add_argument("--lrc-code-dim", type=int, default=40)
     parser.add_argument("--lrc-encoder-hidden", type=int, default=64)
     parser.add_argument(
@@ -1867,8 +3546,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Allow --init-decoder-checkpoint to initialize shared weights when the checkpoint "
-            "uses leaky_relu activations and the requested model uses snake activations. "
-            "Only Snake log_alpha parameters may be newly initialized."
+            "uses leaky_relu activations and the requested model uses snake or snakebeta_aa "
+            "activations. Only the new Snake/SnakeBeta log_alpha/log_beta parameters may be "
+            "newly initialized; the rest of the checkpoint is grafted as-is."
         ),
     )
     parser.add_argument("--post-filter-channels", type=int, default=0)
@@ -1892,9 +3572,128 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "FFT size for spectral decoder variants. Effective default is 1024 for fsd and 512 otherwise. "
-            "iSTFT outputs raw real/imag bins; apnetlite/fsd output amplitude/phase bins."
+            "FFT size for spectral decoder variants. Effective default is 1024 for fsd and "
+            "piperlite_istft_tail, 512 otherwise. "
+            "iSTFT outputs raw real/imag bins; apnetlite/fsd/piperlite_istft_tail output amplitude/phase bins."
         ),
+    )
+    parser.add_argument("--wavehax-channels", type=int, default=32)
+    parser.add_argument("--wavehax-blocks", type=int, default=8)
+    parser.add_argument("--wavehax-mult-channels", type=int, default=2)
+    parser.add_argument("--wavehax-kernel-freq", type=int, default=7)
+    parser.add_argument("--wavehax-kernel-time", type=int, default=7)
+    parser.add_argument(
+        "--wavehax-f0-channel",
+        type=int,
+        default=80,
+        help="Zero-based log-F0 channel in the Kokoro generator_input pack.",
+    )
+    parser.add_argument(
+        "--wavehax-voiced-channel",
+        type=int,
+        default=81,
+        help="Zero-based voicing channel in the Kokoro generator_input pack.",
+    )
+    parser.add_argument("--wavehax-sample-rate", type=int, default=24000)
+    parser.add_argument("--wavehax-prior-power", type=float, default=0.1)
+    parser.add_argument(
+        "--wavehax-prior-noise",
+        type=float,
+        default=0.01,
+        help="Amplitude of deterministic broadband prior noise mixed with the harmonic prior.",
+    )
+    parser.add_argument(
+        "--whx-channels",
+        type=int,
+        default=32,
+        help="For --variant wavehax_faithful, 2D feature-map channel width C (paper: 32).",
+    )
+    parser.add_argument(
+        "--whx-hidden",
+        type=int,
+        default=64,
+        help=(
+            "For --variant wavehax_faithful, ConvNeXt pointwise-expansion hidden width C' "
+            "(paper: 64). Must be a positive multiple of --whx-channels."
+        ),
+    )
+    parser.add_argument(
+        "--whx-blocks",
+        type=int,
+        default=8,
+        help="For --variant wavehax_faithful, number of ConvNeXt2d blocks (paper: 8).",
+    )
+    parser.add_argument(
+        "--whx-n-fft",
+        type=int,
+        default=512,
+        help=(
+            "For --variant wavehax_faithful, FFT size of the complex-spectrogram head "
+            "(frequency bins F = n_fft/2 + 1); hop is the fixed 256-sample frame hop."
+        ),
+    )
+    parser.add_argument(
+        "--whx-f0-channel",
+        type=int,
+        default=80,
+        help="For --variant wavehax_faithful, zero-based log-F0 channel in the Kokoro generator_input pack.",
+    )
+    parser.add_argument(
+        "--whx-voiced-channel",
+        type=int,
+        default=81,
+        help="For --variant wavehax_faithful, zero-based voicing channel in the Kokoro generator_input pack.",
+    )
+    parser.add_argument(
+        "--whx-sample-rate",
+        type=int,
+        default=24000,
+        help="For --variant wavehax_faithful, audio sample rate used by the harmonic prior generator.",
+    )
+    parser.add_argument(
+        "--hift-width",
+        type=int,
+        default=224,
+        help="For --variant hiftlite, channel width of the input projection and AdainResBlk1d body.",
+    )
+    parser.add_argument(
+        "--hift-gen-channels",
+        type=int,
+        default=192,
+        help=(
+            "For --variant hiftlite, HiftGenerator's channel width right after conv_pre, "
+            "before the two /2 upsample stages (must be divisible by 4)."
+        ),
+    )
+    parser.add_argument(
+        "--hift-style-dim",
+        type=int,
+        default=64,
+        help="For --variant hiftlite, dimension of the learned constant style embedding fed to AdaIN1d.",
+    )
+    parser.add_argument(
+        "--hift-body-blocks",
+        type=int,
+        default=3,
+        help="For --variant hiftlite, number of AdainResBlk1d blocks in the body before the generator.",
+    )
+    parser.add_argument(
+        "--hift-f0-channel",
+        type=int,
+        default=80,
+        help="For --variant hiftlite, zero-based log-F0 channel in the Kokoro generator_input pack.",
+    )
+    parser.add_argument(
+        "--hift-voiced-channel",
+        type=int,
+        default=81,
+        help="For --variant hiftlite, zero-based voicing channel in the Kokoro generator_input pack.",
+    )
+    parser.add_argument(
+        "--hift-sample-rate",
+        type=int,
+        default=24000,
+        help="For --variant hiftlite, audio sample rate used by the NSF harmonic source module.",
     )
     parser.add_argument(
         "--ap-amplitude-weight",
@@ -1951,6 +3750,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--crop-frames", type=int, default=64)
     parser.add_argument("--spectral-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--mel-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for HiFi-GAN-style log-mel L1 between generated and target "
+            "audio (their lambda=45). Uses the pack sample rate; filterbank is "
+            "librosa-compatible slaney."
+        ),
+    )
+    parser.add_argument("--mel-loss-n-fft", type=int, default=1024)
+    parser.add_argument("--mel-loss-hop", type=int, default=256)
+    parser.add_argument("--mel-loss-n-mels", type=int, default=80)
+    parser.add_argument(
+        "--frame-comb-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for the frame-rate comb (checkerboard buzz) excess loss: "
+            "penalizes energy at multiples of sample_rate/hop in quiet frames "
+            "beyond the target's own comb excess."
+        ),
+    )
     parser.add_argument(
         "--stft-phase-weight",
         type=float,
@@ -2159,6 +3981,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adv-gate-frame-size", type=int, default=1024)
     parser.add_argument("--adv-gate-frame-hop", type=int, default=256)
     parser.add_argument(
+        "--mrd-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Training-only multi-resolution spectral discriminator (UnivNet-style MRD) "
+            "generator loss weight. Additive alongside the multi-period discriminator."
+        ),
+    )
+    parser.add_argument(
+        "--mrd-feature-weight",
+        type=float,
+        default=0.0,
+        help="Training-only MRD feature-matching loss weight.",
+    )
+    parser.add_argument(
         "--quiet-frame-quantile",
         type=float,
         default=0.10,
@@ -2274,6 +4111,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--log-interval", type=int, default=250)
     parser.add_argument("--render-rows", type=int, default=16)
+    parser.add_argument(
+        "--skip-chunk-eval",
+        action="store_true",
+        help=(
+            "Skip the informational full-length chunk pass after training. "
+            "Useful for large packs when a separate held-out gate will evaluate the checkpoint."
+        ),
+    )
     parser.add_argument("--sentence-silence", type=float, default=0.12)
     parser.add_argument("--assert-max-decoder-params", type=int, default=0)
     parser.add_argument("--seed", type=int, default=4242)
@@ -3231,7 +5076,32 @@ def init_decoder_student_from_checkpoint(
     expected_fsd_blocks: int,
     expected_fsd_film_rank: int,
     expected_fsd_head_rank: int,
+    expected_wavehax_channels: int,
+    expected_wavehax_blocks: int,
+    expected_wavehax_mult_channels: int,
+    expected_wavehax_kernel_freq: int,
+    expected_wavehax_kernel_time: int,
+    expected_wavehax_f0_channel: int,
+    expected_wavehax_voiced_channel: int,
+    expected_wavehax_sample_rate: int,
+    expected_wavehax_prior_power: float,
+    expected_wavehax_prior_noise: float,
+    expected_whx_channels: int,
+    expected_whx_hidden: int,
+    expected_whx_blocks: int,
+    expected_whx_n_fft: int,
+    expected_whx_f0_channel: int,
+    expected_whx_voiced_channel: int,
+    expected_whx_sample_rate: int,
+    expected_hift_width: int,
+    expected_hift_gen_channels: int,
+    expected_hift_style_dim: int,
+    expected_hift_body_blocks: int,
+    expected_hift_f0_channel: int,
+    expected_hift_voiced_channel: int,
+    expected_hift_sample_rate: int,
     expected_stage_projection_bottlenecks: tuple[int, ...],
+    expected_istft_tail_head_rank: int,
     allow_new_post_filter: bool,
     allow_new_pre_tanh_repair: bool,
     allow_leaky_to_snake: bool,
@@ -3259,6 +5129,30 @@ def init_decoder_student_from_checkpoint(
         "fsd_blocks": int(expected_fsd_blocks),
         "fsd_film_rank": int(expected_fsd_film_rank),
         "fsd_head_rank": int(expected_fsd_head_rank),
+        "wavehax_channels": int(expected_wavehax_channels),
+        "wavehax_blocks": int(expected_wavehax_blocks),
+        "wavehax_mult_channels": int(expected_wavehax_mult_channels),
+        "wavehax_kernel_freq": int(expected_wavehax_kernel_freq),
+        "wavehax_kernel_time": int(expected_wavehax_kernel_time),
+        "wavehax_f0_channel": int(expected_wavehax_f0_channel),
+        "wavehax_voiced_channel": int(expected_wavehax_voiced_channel),
+        "wavehax_sample_rate": int(expected_wavehax_sample_rate),
+        "wavehax_prior_power": float(expected_wavehax_prior_power),
+        "wavehax_prior_noise": float(expected_wavehax_prior_noise),
+        "whx_channels": int(expected_whx_channels),
+        "whx_hidden": int(expected_whx_hidden),
+        "whx_blocks": int(expected_whx_blocks),
+        "whx_n_fft": int(expected_whx_n_fft),
+        "whx_f0_channel": int(expected_whx_f0_channel),
+        "whx_voiced_channel": int(expected_whx_voiced_channel),
+        "whx_sample_rate": int(expected_whx_sample_rate),
+        "hift_width": int(expected_hift_width),
+        "hift_gen_channels": int(expected_hift_gen_channels),
+        "hift_style_dim": int(expected_hift_style_dim),
+        "hift_body_blocks": int(expected_hift_body_blocks),
+        "hift_f0_channel": int(expected_hift_f0_channel),
+        "hift_voiced_channel": int(expected_hift_voiced_channel),
+        "hift_sample_rate": int(expected_hift_sample_rate),
         "stage_projection_bottlenecks": list(expected_stage_projection_bottlenecks),
         "post_filter_channels": int(expected_post_filter_channels),
         "post_filter_layers": int(expected_post_filter_layers),
@@ -3269,8 +5163,13 @@ def init_decoder_student_from_checkpoint(
         "pre_tanh_repair_kernel": int(expected_pre_tanh_repair_kernel),
         "pre_tanh_repair_scale": float(expected_pre_tanh_repair_scale),
     }
-    if expected_variant in {"istft", "apnetlite", "fsd", "lrc"} or "istft_n_fft" in config:
+    if (
+        expected_variant in {"istft", "apnetlite", "fsd", "lrc", "wavehax", "piperlite_istft_tail"}
+        or "istft_n_fft" in config
+    ):
         expected["istft_n_fft"] = int(expected_istft_n_fft)
+    if expected_variant == "piperlite_istft_tail" or "istft_tail_head_rank" in config:
+        expected["istft_tail_head_rank"] = int(expected_istft_tail_head_rank)
     mismatches: list[str] = []
     allowed_post_filter_mismatches: list[str] = []
     allowed_pre_tanh_repair_mismatches: list[str] = []
@@ -3301,6 +5200,14 @@ def init_decoder_student_from_checkpoint(
     )
     for key, expected_value in expected.items():
         if key in {"fsd_dim", "fsd_blocks", "fsd_film_rank", "fsd_head_rank"} and expected_variant not in {"fsd", "lrc"}:
+            continue
+        if key == "istft_tail_head_rank" and expected_variant != "piperlite_istft_tail":
+            continue
+        if key.startswith("wavehax_") and expected_variant != "wavehax":
+            continue
+        if key.startswith("whx_") and expected_variant != "wavehax_faithful":
+            continue
+        if key.startswith("hift_") and expected_variant != "hiftlite":
             continue
         if key == "stage_projection_bottlenecks" and expected_variant != "pb" and not expected_value:
             continue
@@ -3398,7 +5305,7 @@ def init_decoder_student_from_checkpoint(
                     allow_leaky_to_snake
                     and key == "activation"
                     and actual_str == "leaky_relu"
-                    and expected_value == "snake"
+                    and expected_value in {"snake", "snakebeta_aa"}
                 ):
                     allowed_activation_mismatches.append(message)
                 else:
@@ -3417,7 +5324,9 @@ def init_decoder_student_from_checkpoint(
             is_allowed_pre_tanh_repair = (
                 bool(allowed_pre_tanh_repair_mismatches) and key.startswith("pre_tanh_repair.")
             )
-            is_allowed_snake_param = bool(allowed_activation_mismatches) and key.endswith(".log_alpha")
+            is_allowed_snake_param = bool(allowed_activation_mismatches) and (
+                key.endswith(".log_alpha") or key.endswith(".log_beta")
+            )
             if not is_allowed_post_filter and not is_allowed_pre_tanh_repair and not is_allowed_snake_param:
                 disallowed_missing.append(key)
         if disallowed_missing or unexpected_keys:
@@ -4077,6 +5986,74 @@ def multi_resolution_stft_loss(prediction: torch.Tensor, target: torch.Tensor) -
     return loss / float(len(configs))
 
 
+_MEL_FILTERBANK_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _slaney_mel_filterbank(sample_rate: int, n_fft: int, n_mels: int,
+                           device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Librosa-compatible (htk=False, norm='slaney') mel filterbank [n_mels, n_fft//2+1].
+
+    Hand-rolled so the trainer keeps zero librosa/torchaudio dependency; matches
+    the filterbank HiFi-GAN's mel loss uses (librosa_mel_fn defaults)."""
+    key = (int(sample_rate), int(n_fft), int(n_mels), str(device), str(dtype))
+    cached = _MEL_FILTERBANK_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def hz_to_mel(f: np.ndarray) -> np.ndarray:
+        f = np.asarray(f, dtype=np.float64)
+        mel = f / (200.0 / 3.0)
+        log_region = f >= 1000.0
+        mel[log_region] = 15.0 + np.log(f[log_region] / 1000.0) / (np.log(6.4) / 27.0)
+        return mel
+
+    def mel_to_hz(m: np.ndarray) -> np.ndarray:
+        m = np.asarray(m, dtype=np.float64)
+        f = m * (200.0 / 3.0)
+        log_region = m >= 15.0
+        f[log_region] = 1000.0 * np.exp((np.log(6.4) / 27.0) * (m[log_region] - 15.0))
+        return f
+
+    fmax = float(sample_rate) / 2.0
+    mel_pts = np.linspace(hz_to_mel(np.array([0.0]))[0], hz_to_mel(np.array([fmax]))[0], n_mels + 2)
+    hz_pts = mel_to_hz(mel_pts)
+    fft_freqs = np.linspace(0.0, fmax, n_fft // 2 + 1)
+    fb = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float64)
+    fdiff = np.diff(hz_pts)
+    ramps = hz_pts[:, None] - fft_freqs[None, :]
+    for i in range(n_mels):
+        lower = -ramps[i] / fdiff[i]
+        upper = ramps[i + 2] / fdiff[i + 1]
+        fb[i] = np.maximum(0.0, np.minimum(lower, upper))
+    enorm = 2.0 / (hz_pts[2:n_mels + 2] - hz_pts[:n_mels])
+    fb *= enorm[:, None]
+    tensor = torch.as_tensor(fb, device=device, dtype=dtype)
+    _MEL_FILTERBANK_CACHE[key] = tensor
+    return tensor
+
+
+def log_mel_l1_loss(prediction: torch.Tensor, target: torch.Tensor,
+                    sample_rate: int, n_fft: int, hop_length: int,
+                    n_mels: int) -> torch.Tensor:
+    """HiFi-GAN's mel-spectrogram L1 (their lambda=45 term): L1 between log-mel
+    of generated and real audio. The single most load-bearing reconstruction
+    loss in their ablation (-0.85 MOS when removed); absent from this trainer
+    until the Kokoro 4.0 push (2026-07-14)."""
+    pred = prediction.squeeze(1)
+    true = target.squeeze(1)
+    window = torch.hann_window(n_fft, device=prediction.device)
+    fb = _slaney_mel_filterbank(sample_rate, n_fft, n_mels, prediction.device, torch.float32)
+    losses = []
+    for wav in (pred, true):
+        spec = torch.stft(wav.float(), n_fft=n_fft, hop_length=hop_length,
+                          win_length=n_fft, window=window, center=True,
+                          return_complex=True)
+        mag = torch.abs(spec)
+        mel = torch.matmul(fb, mag)
+        losses.append(torch.log(torch.clamp(mel, min=1e-5)))
+    return F.l1_loss(losses[0], losses[1])
+
+
 def multi_resolution_stft_phase_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred = prediction.squeeze(1)
     true = target.squeeze(1)
@@ -4319,6 +6296,49 @@ def quiet_sample_excess_loss(
     mask = (target_abs <= threshold).to(dtype=prediction.dtype)
     excess = F.relu(torch.abs(prediction) - target_abs * float(target_scale) - float(margin))
     return torch.sum(excess * mask) / torch.sum(mask).clamp_min(1.0)
+
+
+def frame_comb_excess_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    sample_rate: int,
+    hop_length: int = 256,
+    n_harmonics: int = 32,
+    quiet_quantile: float = 1.0,  # 1.0 = all frames; voiced-frame comb is the audible buzz (2026-07-25)
+) -> torch.Tensor:
+    """Penalize checkerboard buzz: energy at multiples of the frame rate
+    (sample_rate/hop_length, e.g. 93.75 Hz @ 24k/256) in excess of the
+    neighboring off-comb bins, beyond whatever excess the target itself has.
+    Measured on the quieter half of frames, where the comb is audible as buzz
+    (diagnosed 2026-07-15: student +5.1 dB vs teacher +0.8 dB on this metric)."""
+    n_fft = 2048
+    window = torch.hann_window(n_fft, device=prediction.device)
+    frame_hz = float(sample_rate) / float(hop_length)
+    freqs = torch.fft.rfftfreq(n_fft, d=1.0 / float(sample_rate)).to(prediction.device)
+    comb_idx, off_idx = [], []
+    for m in range(1, n_harmonics + 1):
+        comb_idx.append(int(torch.argmin(torch.abs(freqs - frame_hz * m))))
+        off_idx.append(int(torch.argmin(torch.abs(freqs - frame_hz * (m + 0.5)))))
+    comb_t = torch.tensor(comb_idx, device=prediction.device)
+    off_t = torch.tensor(off_idx, device=prediction.device)
+
+    def comb_excess(wav: torch.Tensor) -> torch.Tensor:
+        spec = torch.stft(wav.squeeze(1).float(), n_fft=n_fft, hop_length=n_fft // 4,
+                          win_length=n_fft, window=window, center=True,
+                          return_complex=True)
+        power = spec.abs().pow(2.0) + 1e-10          # [B, bins, T]
+        energy = power.sum(dim=1)                     # [B, T]
+        thresh = torch.quantile(energy, quiet_quantile, dim=1, keepdim=True)
+        quiet = (energy <= thresh).float().unsqueeze(1)
+        log_p = torch.log(power)
+        comb = (log_p.index_select(1, comb_t) * quiet).sum(dim=(1, 2))
+        off = (log_p.index_select(1, off_t) * quiet).sum(dim=(1, 2))
+        count = quiet.sum(dim=(1, 2)) * float(len(comb_idx)) + 1e-6
+        return (comb - off) / count                  # mean log-excess per bin
+
+    excess_pred = comb_excess(prediction)
+    excess_true = comb_excess(target)
+    return F.relu(excess_pred - excess_true).mean()
 
 
 def high_band_excess_loss(
@@ -5412,7 +7432,7 @@ def html_page(rendered: list[dict[str, Any]], dataset_label: str) -> str:
 
 def train(args: argparse.Namespace) -> dict[str, Any]:
     if args.istft_n_fft is None:
-        args.istft_n_fft = 1024 if str(args.variant) in {"fsd", "lrc"} else 512
+        args.istft_n_fft = 1024 if str(args.variant) in {"fsd", "lrc", "piperlite_istft_tail"} else 512
     if not (0.0 <= float(args.acoustic_latent_mix_prob) <= 1.0):
         raise ValueError(f"--acoustic-latent-mix-prob must be in [0, 1], got {args.acoustic_latent_mix_prob}")
     if not (0.0 <= float(args.acoustic_latent_residual_prob) <= 1.0):
@@ -5545,6 +7565,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"--adv-start-step must be >= 1, got {args.adv_start_step}")
     if float(args.adv_lr) <= 0.0:
         raise ValueError(f"--adv-lr must be positive, got {args.adv_lr}")
+    if float(args.mrd_weight) < 0.0:
+        raise ValueError(f"--mrd-weight must be non-negative, got {args.mrd_weight}")
+    if float(args.mrd_feature_weight) < 0.0:
+        raise ValueError(f"--mrd-feature-weight must be non-negative, got {args.mrd_feature_weight}")
     if not (0.0 < float(args.adv_gate_quantile) < 1.0):
         raise ValueError(f"--adv-gate-quantile must be in (0, 1), got {args.adv_gate_quantile}")
     if float(args.adv_gate_sharpness) <= 0.0:
@@ -5589,6 +7613,32 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         )
     if int(args.istft_n_fft) <= 0 or int(args.istft_n_fft) % 2 != 0:
         raise ValueError(f"--istft-n-fft must be a positive even integer, got {args.istft_n_fft}")
+    for name in ("wavehax_channels", "wavehax_blocks", "wavehax_mult_channels", "wavehax_sample_rate"):
+        if int(getattr(args, name)) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive, got {getattr(args, name)}")
+    for name in ("wavehax_kernel_freq", "wavehax_kernel_time"):
+        value = int(getattr(args, name))
+        if value <= 0 or value % 2 == 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be a positive odd integer, got {value}")
+    if int(args.wavehax_f0_channel) < 0 or int(args.wavehax_voiced_channel) < 0:
+        raise ValueError("--wavehax-f0-channel and --wavehax-voiced-channel must be non-negative")
+    if int(args.wavehax_f0_channel) == int(args.wavehax_voiced_channel):
+        raise ValueError("--wavehax-f0-channel and --wavehax-voiced-channel must differ")
+    if float(args.wavehax_prior_power) <= 0.0 or float(args.wavehax_prior_noise) < 0.0:
+        raise ValueError("--wavehax-prior-power must be positive and --wavehax-prior-noise non-negative")
+    for name in ("whx_channels", "whx_hidden", "whx_blocks", "whx_sample_rate"):
+        if int(getattr(args, name)) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive, got {getattr(args, name)}")
+    if int(args.whx_hidden) % int(args.whx_channels) != 0:
+        raise ValueError(
+            f"--whx-hidden {args.whx_hidden} must be a positive multiple of --whx-channels {args.whx_channels}"
+        )
+    if int(args.whx_n_fft) <= 0 or int(args.whx_n_fft) % 2 != 0:
+        raise ValueError(f"--whx-n-fft must be a positive even integer, got {args.whx_n_fft}")
+    if int(args.whx_f0_channel) < 0 or int(args.whx_voiced_channel) < 0:
+        raise ValueError("--whx-f0-channel and --whx-voiced-channel must be non-negative")
+    if int(args.whx_f0_channel) == int(args.whx_voiced_channel):
+        raise ValueError("--whx-f0-channel and --whx-voiced-channel must differ")
     if int(args.fsd_dim) <= 0:
         raise ValueError(f"--fsd-dim must be positive, got {args.fsd_dim}")
     if int(args.fsd_blocks) <= 0:
@@ -5597,6 +7647,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"--fsd-film-rank must be positive, got {args.fsd_film_rank}")
     if int(args.fsd_head_rank) <= 0:
         raise ValueError(f"--fsd-head-rank must be positive, got {args.fsd_head_rank}")
+    if int(args.istft_tail_head_rank) <= 0:
+        raise ValueError(f"--istft-tail-head-rank must be positive, got {args.istft_tail_head_rank}")
     if int(args.lrc_code_dim) <= 0:
         raise ValueError(f"--lrc-code-dim must be positive, got {args.lrc_code_dim}")
     if int(args.lrc_encoder_hidden) <= 0:
@@ -5613,34 +7665,45 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"--ap-complex-weight must be non-negative, got {args.ap_complex_weight}")
     if float(args.spectral_head_init_scale) <= 0.0:
         raise ValueError(f"--spectral-head-init-scale must be positive, got {args.spectral_head_init_scale}")
-    if str(args.spectral_head_init) != "default" and str(args.variant) not in {"istft", "apnetlite", "fsd", "lrc"}:
-        raise RuntimeError("--spectral-head-init zero/small requires --variant istft, apnetlite, fsd, or lrc")
+    if str(args.spectral_head_init) != "default" and str(args.variant) not in {
+        "istft",
+        "apnetlite",
+        "fsd",
+        "lrc",
+        "piperlite_istft_tail",
+    }:
+        raise RuntimeError(
+            "--spectral-head-init zero/small requires --variant istft, apnetlite, fsd, lrc, or piperlite_istft_tail"
+        )
     if str(args.variant) in {"fsd", "lrc"} and float(args.ap_phase_weight) > 0.0:
         raise RuntimeError(f"--variant {args.variant} does not support --ap-phase-weight; use 0")
-    if str(args.variant) != "apnetlite" and (
+    if str(args.variant) not in {"apnetlite", "piperlite_istft_tail"} and (
         float(args.ap_amplitude_weight) > 0.0
         or float(args.ap_phase_weight) > 0.0
         or float(args.ap_complex_weight) > 0.0
     ):
-        raise RuntimeError("AP amplitude/phase/complex losses require --variant apnetlite")
-    if str(args.variant) in {"istft", "apnetlite", "fsd", "lrc"} and (
+        raise RuntimeError("AP amplitude/phase/complex losses require --variant apnetlite or piperlite_istft_tail")
+    if str(args.variant) in {"istft", "apnetlite", "fsd", "lrc", "wavehax", "wavehax_faithful", "piperlite_istft_tail", "hiftlite"} and (
         int(args.post_filter_channels) > 0 or int(args.post_filter_layers) > 0
     ):
-        raise RuntimeError("--variant istft/apnetlite/fsd/lrc does not support waveform post-filter parameters")
-    if str(args.variant) in {"istft", "apnetlite", "fsd", "lrc"} and (
+        raise RuntimeError("spectral decoder variants do not support waveform post-filter parameters")
+    if str(args.variant) in {"istft", "apnetlite", "fsd", "lrc", "wavehax", "wavehax_faithful", "piperlite_istft_tail", "hiftlite"} and (
         int(args.pre_tanh_repair_channels) > 0 or int(args.pre_tanh_repair_layers) > 0
     ):
-        raise RuntimeError("--variant istft/apnetlite/fsd/lrc does not support pre-tanh repair parameters")
-    if str(args.variant) in {"istft", "apnetlite", "fsd", "lrc"} and args.teacher_init_checkpoint is not None:
-        raise RuntimeError("--variant istft/apnetlite/fsd/lrc cannot use --teacher-init-checkpoint")
-    if str(args.variant) in {"istft", "apnetlite", "fsd", "lrc"} and (
+        raise RuntimeError("spectral decoder variants do not support pre-tanh repair parameters")
+    if (
+        str(args.variant) in {"istft", "apnetlite", "fsd", "lrc", "wavehax", "wavehax_faithful", "piperlite_istft_tail", "hiftlite"}
+        and args.teacher_init_checkpoint is not None
+    ):
+        raise RuntimeError("spectral decoder variants cannot use --teacher-init-checkpoint")
+    if str(args.variant) in {"istft", "apnetlite", "fsd", "lrc", "wavehax", "wavehax_faithful", "piperlite_istft_tail", "hiftlite"} and (
         float(args.feature_hint_weight) > 0.0
         or float(args.feature_exact_weight) > 0.0
         or float(args.signature_hint_weight) > 0.0
         or float(args.signature_temporal_weight) > 0.0
         or float(args.signature_phase_weight) > 0.0
     ):
-        raise RuntimeError("--variant istft/apnetlite/fsd/lrc does not support teacher feature/signature hint losses yet")
+        raise RuntimeError("spectral decoder variants do not support teacher feature/signature hint losses yet")
     if has_alt_input_targets and (
         float(args.feature_hint_weight) > 0.0
         or float(args.feature_exact_weight) > 0.0
@@ -5766,6 +7829,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     sample_rate = int(rows[0].get("sample_rate") or 22050)
     if sample_rate <= 0:
         raise RuntimeError(f"{args.pack_dir}: invalid sample_rate {sample_rate}")
+    if str(args.variant) == "wavehax" and int(args.wavehax_sample_rate) != sample_rate:
+        raise RuntimeError(
+            f"--wavehax-sample-rate {args.wavehax_sample_rate} does not match pack sample_rate {sample_rate}"
+        )
+    if str(args.variant) == "wavehax_faithful" and int(args.whx_sample_rate) != sample_rate:
+        raise RuntimeError(
+            f"--whx-sample-rate {args.whx_sample_rate} does not match pack sample_rate {sample_rate}"
+        )
+    if str(args.variant) == "hiftlite" and int(args.hift_sample_rate) != sample_rate:
+        raise RuntimeError(
+            f"--hift-sample-rate {args.hift_sample_rate} does not match pack sample_rate {sample_rate}"
+        )
     if float(args.high_band_excess_weight) > 0.0 and float(args.high_band_excess_hz) >= float(sample_rate) / 2.0:
         raise ValueError(
             f"--high-band-excess-hz {args.high_band_excess_hz} must be below Nyquist for sample_rate {sample_rate}"
@@ -5883,7 +7958,32 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         fsd_blocks=int(args.fsd_blocks),
         fsd_film_rank=int(args.fsd_film_rank),
         fsd_head_rank=int(args.fsd_head_rank),
+        wavehax_channels=int(args.wavehax_channels),
+        wavehax_blocks=int(args.wavehax_blocks),
+        wavehax_mult_channels=int(args.wavehax_mult_channels),
+        wavehax_kernel_freq=int(args.wavehax_kernel_freq),
+        wavehax_kernel_time=int(args.wavehax_kernel_time),
+        wavehax_f0_channel=int(args.wavehax_f0_channel),
+        wavehax_voiced_channel=int(args.wavehax_voiced_channel),
+        wavehax_sample_rate=int(args.wavehax_sample_rate),
+        wavehax_prior_power=float(args.wavehax_prior_power),
+        wavehax_prior_noise=float(args.wavehax_prior_noise),
+        whx_channels=int(args.whx_channels),
+        whx_hidden=int(args.whx_hidden),
+        whx_blocks=int(args.whx_blocks),
+        whx_n_fft=int(args.whx_n_fft),
+        whx_f0_channel=int(args.whx_f0_channel),
+        whx_voiced_channel=int(args.whx_voiced_channel),
+        whx_sample_rate=int(args.whx_sample_rate),
         stage_projection_bottlenecks=stage_projection_bottlenecks,
+        istft_tail_head_rank=int(args.istft_tail_head_rank),
+        hift_width=int(args.hift_width),
+        hift_gen_channels=int(args.hift_gen_channels),
+        hift_style_dim=int(args.hift_style_dim),
+        hift_body_blocks=int(args.hift_body_blocks),
+        hift_f0_channel=int(args.hift_f0_channel),
+        hift_voiced_channel=int(args.hift_voiced_channel),
+        hift_sample_rate=int(args.hift_sample_rate),
     ).to(device)
     spectral_head_init_summary = initialize_spectral_heads(
         model,
@@ -5926,6 +8026,30 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             expected_fsd_blocks=int(args.fsd_blocks),
             expected_fsd_film_rank=int(args.fsd_film_rank),
             expected_fsd_head_rank=int(args.fsd_head_rank),
+            expected_wavehax_channels=int(args.wavehax_channels),
+            expected_wavehax_blocks=int(args.wavehax_blocks),
+            expected_wavehax_mult_channels=int(args.wavehax_mult_channels),
+            expected_wavehax_kernel_freq=int(args.wavehax_kernel_freq),
+            expected_wavehax_kernel_time=int(args.wavehax_kernel_time),
+            expected_wavehax_f0_channel=int(args.wavehax_f0_channel),
+            expected_wavehax_voiced_channel=int(args.wavehax_voiced_channel),
+            expected_wavehax_sample_rate=int(args.wavehax_sample_rate),
+            expected_wavehax_prior_power=float(args.wavehax_prior_power),
+            expected_wavehax_prior_noise=float(args.wavehax_prior_noise),
+            expected_whx_channels=int(args.whx_channels),
+            expected_whx_hidden=int(args.whx_hidden),
+            expected_whx_blocks=int(args.whx_blocks),
+            expected_whx_n_fft=int(args.whx_n_fft),
+            expected_whx_f0_channel=int(args.whx_f0_channel),
+            expected_whx_voiced_channel=int(args.whx_voiced_channel),
+            expected_whx_sample_rate=int(args.whx_sample_rate),
+            expected_hift_width=int(args.hift_width),
+            expected_hift_gen_channels=int(args.hift_gen_channels),
+            expected_hift_style_dim=int(args.hift_style_dim),
+            expected_hift_body_blocks=int(args.hift_body_blocks),
+            expected_hift_f0_channel=int(args.hift_f0_channel),
+            expected_hift_voiced_channel=int(args.hift_voiced_channel),
+            expected_hift_sample_rate=int(args.hift_sample_rate),
             expected_stage_projection_bottlenecks=stage_projection_bottlenecks,
             expected_post_filter_channels=int(args.post_filter_channels),
             expected_post_filter_layers=int(args.post_filter_layers),
@@ -5936,6 +8060,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             expected_pre_tanh_repair_kernel=int(args.pre_tanh_repair_kernel),
             expected_pre_tanh_repair_scale=float(args.pre_tanh_repair_scale),
             expected_istft_n_fft=int(args.istft_n_fft),
+            expected_istft_tail_head_rank=int(args.istft_tail_head_rank),
             allow_new_post_filter=bool(args.allow_new_post_filter_init),
             allow_new_pre_tanh_repair=bool(args.allow_new_pre_tanh_repair_init),
             allow_leaky_to_snake=bool(args.allow_leaky_to_snake_init),
@@ -6020,7 +8145,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             f"decoder parameter count {parameter_count} exceeds --assert-max-decoder-params "
             f"{int(args.assert_max_decoder_params)}"
         )
-    if str(args.variant) in {"fsd", "lrc", "pb"} or int(args.assert_max_decoder_params) > 0:
+    if (
+        str(args.variant) in {"fsd", "lrc", "pb", "piperlite_istft_tail", "hiftlite", "wavehax_faithful"}
+        or int(args.assert_max_decoder_params) > 0
+    ):
         print(
             json.dumps(
                 {
@@ -6053,6 +8181,17 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         delta_discriminator_parameter_count = count_parameters(delta_discriminator)
         delta_discriminator_optimizer = torch.optim.AdamW(
             delta_discriminator.parameters(),
+            lr=float(args.adv_lr),
+            weight_decay=1e-5,
+        )
+    mrd_discriminator: MultiResolutionSpectralDiscriminator | None = None
+    mrd_discriminator_optimizer: torch.optim.Optimizer | None = None
+    mrd_discriminator_parameter_count = 0
+    if float(args.mrd_weight) > 0.0 or float(args.mrd_feature_weight) > 0.0:
+        mrd_discriminator = MultiResolutionSpectralDiscriminator().to(device)
+        mrd_discriminator_parameter_count = count_parameters(mrd_discriminator)
+        mrd_discriminator_optimizer = torch.optim.AdamW(
+            mrd_discriminator.parameters(),
             lr=float(args.adv_lr),
             weight_decay=1e-5,
         )
@@ -6242,6 +8381,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if prediction.shape != target.shape:
             raise RuntimeError(f"prediction shape {prediction.shape} != target shape {target.shape}")
         waveform_l1 = F.l1_loss(prediction, target)
+        mel_l1 = (
+            log_mel_l1_loss(
+                prediction,
+                target,
+                sample_rate=sample_rate,
+                n_fft=int(args.mel_loss_n_fft),
+                hop_length=int(args.mel_loss_hop),
+                n_mels=int(args.mel_loss_n_mels),
+            )
+            if float(args.mel_loss_weight) > 0.0
+            else prediction.new_tensor(0.0)
+        )
         spectral = multi_resolution_stft_loss(prediction, target) if args.spectral_weight > 0 else prediction.new_tensor(0.0)
         stft_phase = (
             multi_resolution_stft_phase_loss(prediction, target)
@@ -6302,6 +8453,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 margin_db=float(args.high_band_excess_margin_db),
             )
             if float(args.high_band_excess_weight) > 0.0
+            else prediction.new_tensor(0.0)
+        )
+        frame_comb = (
+            frame_comb_excess_loss(prediction, target, sample_rate=sample_rate)
+            if float(args.frame_comb_weight) > 0.0
             else prediction.new_tensor(0.0)
         )
         echo_tail = (
@@ -6471,8 +8627,45 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError(f"non-finite delta generator adversarial loss at step {step}")
             if not torch.isfinite(adversarial_delta_feature):
                 raise RuntimeError(f"non-finite delta adversarial feature loss at step {step}")
+        mrd_generator = prediction.new_tensor(0.0)
+        mrd_feature = prediction.new_tensor(0.0)
+        mrd_discriminator_loss = prediction.new_tensor(0.0)
+        mrd_discriminator_grad_norm = 0.0
+        if (
+            mrd_discriminator is not None
+            and mrd_discriminator_optimizer is not None
+            and step >= int(args.adv_start_step)
+        ):
+            mrd_target = target.detach()
+            set_requires_grad(mrd_discriminator, True)
+            mrd_discriminator_optimizer.zero_grad(set_to_none=True)
+            mrd_real_scores, _mrd_real_features = mrd_discriminator(mrd_target)
+            mrd_fake_scores, _mrd_fake_features = mrd_discriminator(prediction.detach())
+            mrd_discriminator_loss = discriminator_lsgan_loss(mrd_real_scores, mrd_fake_scores)
+            if not torch.isfinite(mrd_discriminator_loss):
+                raise RuntimeError(f"non-finite MRD discriminator loss at step {step}")
+            mrd_discriminator_loss.backward()
+            mrd_discriminator_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(mrd_discriminator.parameters(), max_norm=5.0).detach().cpu()
+            )
+            mrd_discriminator_optimizer.step()
+
+            set_requires_grad(mrd_discriminator, False)
+            mrd_fake_scores_for_generator, mrd_fake_features_for_generator = mrd_discriminator(prediction)
+            _mrd_real_scores_for_generator, mrd_real_features_for_generator = mrd_discriminator(mrd_target)
+            mrd_generator = generator_lsgan_loss(mrd_fake_scores_for_generator)
+            mrd_feature = discriminator_feature_matching_loss(
+                mrd_real_features_for_generator,
+                mrd_fake_features_for_generator,
+            )
+            set_requires_grad(mrd_discriminator, True)
+            if not torch.isfinite(mrd_generator):
+                raise RuntimeError(f"non-finite MRD generator adversarial loss at step {step}")
+            if not torch.isfinite(mrd_feature):
+                raise RuntimeError(f"non-finite MRD feature loss at step {step}")
         loss = (
             waveform_l1
+            + float(args.mel_loss_weight) * mel_l1
             + float(args.spectral_weight) * spectral
             + float(args.stft_phase_weight) * stft_phase
             + float(args.feature_hint_weight) * hint
@@ -6490,12 +8683,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             + float(args.click_delta_weight) * click_delta
             + float(args.quiet_sample_weight) * quiet_sample
             + float(args.high_band_excess_weight) * high_band_excess
+            + float(args.frame_comb_weight) * frame_comb
             + float(args.echo_tail_weight) * echo_tail
             + float(args.paired_acoustic_residual_weight) * paired_acoustic
             + float(args.adv_weight) * adversarial_generator
             + float(args.adv_feature_weight) * adversarial_feature
             + float(args.adv_delta_weight) * adversarial_delta_generator
             + float(args.adv_delta_feature_weight) * adversarial_delta_feature
+            + float(args.mrd_weight) * mrd_generator
+            + float(args.mrd_feature_weight) * mrd_feature
         )
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite loss at step {step}")
@@ -6508,6 +8704,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "step": int(step),
                 "loss": float(loss.detach().cpu()),
                 "waveform_l1": float(waveform_l1.detach().cpu()),
+                "mel_l1": float(mel_l1.detach().cpu()),
+                "frame_comb": float(frame_comb.detach().cpu()),
                 "spectral": float(spectral.detach().cpu()),
                 "stft_phase": float(stft_phase.detach().cpu()),
                 "feature_hint": float(hint.detach().cpu()),
@@ -6539,6 +8737,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "adversarial_delta_feature": float(adversarial_delta_feature.detach().cpu()),
                 "adversarial_delta_discriminator": float(adversarial_delta_discriminator.detach().cpu()),
                 "adversarial_delta_gate_mean": adversarial_delta_gate_mean,
+                "mrd_generator": float(mrd_generator.detach().cpu()),
+                "mrd_feature": float(mrd_feature.detach().cpu()),
+                "mrd_discriminator": float(mrd_discriminator_loss.detach().cpu()),
+                "mrd_discriminator_grad_norm": mrd_discriminator_grad_norm,
                 "grad_norm": grad_norm,
                 "discriminator_grad_norm": discriminator_grad_norm,
                 "delta_discriminator_grad_norm": delta_discriminator_grad_norm,
@@ -6579,15 +8781,22 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     # Full-length chunk evaluation can exceed MPS kernel size limits; it is
     # informational, so never let it destroy a finished training run.
-    try:
-        train_chunk_eval = evaluate_chunks(model, samples, device, lrc_encoder=lrc_encoder)
-        eval_chunk_eval = (
-            evaluate_chunks(model, eval_samples, device, lrc_encoder=lrc_encoder) if eval_samples is not None else None
-        )
-    except NotImplementedError as exc:
-        print(json.dumps({"chunk_eval_skipped": f"{type(exc).__name__}: {exc}"}), flush=True)
+    if args.skip_chunk_eval:
         train_chunk_eval = None
         eval_chunk_eval = None
+        print(json.dumps({"chunk_eval_skipped": "requested by --skip-chunk-eval"}), flush=True)
+    else:
+        try:
+            train_chunk_eval = evaluate_chunks(model, samples, device, lrc_encoder=lrc_encoder)
+            eval_chunk_eval = (
+                evaluate_chunks(model, eval_samples, device, lrc_encoder=lrc_encoder)
+                if eval_samples is not None
+                else None
+            )
+        except NotImplementedError as exc:
+            print(json.dumps({"chunk_eval_skipped": f"{type(exc).__name__}: {exc}"}), flush=True)
+            train_chunk_eval = None
+            eval_chunk_eval = None
     checkpoint = args.out_dir / "decoder-student.pt"
     lrc_encoder_checkpoint = args.out_dir / "lrc-encoder.pt" if lrc_encoder is not None else None
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -6619,6 +8828,30 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "fsd_blocks": int(args.fsd_blocks),
                 "fsd_film_rank": int(args.fsd_film_rank),
                 "fsd_head_rank": int(args.fsd_head_rank),
+                "wavehax_channels": int(args.wavehax_channels),
+                "wavehax_blocks": int(args.wavehax_blocks),
+                "wavehax_mult_channels": int(args.wavehax_mult_channels),
+                "wavehax_kernel_freq": int(args.wavehax_kernel_freq),
+                "wavehax_kernel_time": int(args.wavehax_kernel_time),
+                "wavehax_f0_channel": int(args.wavehax_f0_channel),
+                "wavehax_voiced_channel": int(args.wavehax_voiced_channel),
+                "wavehax_sample_rate": int(args.wavehax_sample_rate),
+                "wavehax_prior_power": float(args.wavehax_prior_power),
+                "wavehax_prior_noise": float(args.wavehax_prior_noise),
+                "whx_channels": int(args.whx_channels),
+                "whx_hidden": int(args.whx_hidden),
+                "whx_blocks": int(args.whx_blocks),
+                "whx_n_fft": int(args.whx_n_fft),
+                "whx_f0_channel": int(args.whx_f0_channel),
+                "whx_voiced_channel": int(args.whx_voiced_channel),
+                "whx_sample_rate": int(args.whx_sample_rate),
+                "hift_width": int(args.hift_width),
+                "hift_gen_channels": int(args.hift_gen_channels),
+                "hift_style_dim": int(args.hift_style_dim),
+                "hift_body_blocks": int(args.hift_body_blocks),
+                "hift_f0_channel": int(args.hift_f0_channel),
+                "hift_voiced_channel": int(args.hift_voiced_channel),
+                "hift_sample_rate": int(args.hift_sample_rate),
                 "stage_projection_bottlenecks": list(stage_projection_bottlenecks),
                 "teacher_init_checkpoint": str(args.teacher_init_checkpoint) if args.teacher_init_checkpoint else None,
                 "teacher_init_method": str(args.teacher_init_method),
@@ -6634,6 +8867,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "pre_tanh_repair_kernel": int(args.pre_tanh_repair_kernel),
                 "pre_tanh_repair_scale": float(args.pre_tanh_repair_scale),
                 "istft_n_fft": int(args.istft_n_fft),
+                "istft_tail_head_rank": int(args.istft_tail_head_rank),
                 "ap_amplitude_weight": float(args.ap_amplitude_weight),
                 "ap_phase_weight": float(args.ap_phase_weight),
                 "ap_complex_weight": float(args.ap_complex_weight),
@@ -6683,6 +8917,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "lrc_encoder_training_only_parameters": int(lrc_encoder_parameter_count),
             "adversarial_discriminator_parameters": discriminator_parameter_count,
             "adversarial_delta_discriminator_parameters": delta_discriminator_parameter_count,
+            "mrd_discriminator_parameters": mrd_discriminator_parameter_count,
         },
         checkpoint,
     )
@@ -6776,6 +9011,30 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "fsd_blocks": int(args.fsd_blocks),
         "fsd_film_rank": int(args.fsd_film_rank),
         "fsd_head_rank": int(args.fsd_head_rank),
+        "wavehax_channels": int(args.wavehax_channels),
+        "wavehax_blocks": int(args.wavehax_blocks),
+        "wavehax_mult_channels": int(args.wavehax_mult_channels),
+        "wavehax_kernel_freq": int(args.wavehax_kernel_freq),
+        "wavehax_kernel_time": int(args.wavehax_kernel_time),
+        "wavehax_f0_channel": int(args.wavehax_f0_channel),
+        "wavehax_voiced_channel": int(args.wavehax_voiced_channel),
+        "wavehax_sample_rate": int(args.wavehax_sample_rate),
+        "wavehax_prior_power": float(args.wavehax_prior_power),
+        "wavehax_prior_noise": float(args.wavehax_prior_noise),
+        "whx_channels": int(args.whx_channels),
+        "whx_hidden": int(args.whx_hidden),
+        "whx_blocks": int(args.whx_blocks),
+        "whx_n_fft": int(args.whx_n_fft),
+        "whx_f0_channel": int(args.whx_f0_channel),
+        "whx_voiced_channel": int(args.whx_voiced_channel),
+        "whx_sample_rate": int(args.whx_sample_rate),
+        "hift_width": int(args.hift_width),
+        "hift_gen_channels": int(args.hift_gen_channels),
+        "hift_style_dim": int(args.hift_style_dim),
+        "hift_body_blocks": int(args.hift_body_blocks),
+        "hift_f0_channel": int(args.hift_f0_channel),
+        "hift_voiced_channel": int(args.hift_voiced_channel),
+        "hift_sample_rate": int(args.hift_sample_rate),
         "lrc_code_dim": int(args.lrc_code_dim),
         "lrc_encoder_hidden": int(args.lrc_encoder_hidden),
         "stage_projection_bottlenecks": list(stage_projection_bottlenecks),
@@ -6794,6 +9053,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "pre_tanh_repair_scale": float(args.pre_tanh_repair_scale),
         "freeze_decoder_body": bool(args.freeze_decoder_body),
         "istft_n_fft": int(args.istft_n_fft),
+        "istft_tail_head_rank": int(args.istft_tail_head_rank),
         "ap_amplitude_weight": float(args.ap_amplitude_weight),
         "ap_phase_weight": float(args.ap_phase_weight),
         "ap_complex_weight": float(args.ap_complex_weight),
@@ -6841,6 +9101,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "adv_gate_mode": str(args.adv_gate_mode),
         "adv_gate_quantile": float(args.adv_gate_quantile),
         "adv_gate_sharpness": float(args.adv_gate_sharpness),
+        "mrd_weight": float(args.mrd_weight),
+        "mrd_feature_weight": float(args.mrd_feature_weight),
         "adv_gate_frame_size": int(args.adv_gate_frame_size),
         "adv_gate_frame_hop": int(args.adv_gate_frame_hop),
         "quiet_frame_quantile": float(args.quiet_frame_quantile),
@@ -6901,11 +9163,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "lrc_encoder_trainable_parameters": int(lrc_encoder_trainable_parameter_count),
         "adversarial_discriminator_parameters": int(discriminator_parameter_count),
         "adversarial_delta_discriminator_parameters": int(delta_discriminator_parameter_count),
+        "mrd_discriminator_parameters": int(mrd_discriminator_parameter_count),
         "logs": logs,
         "train_chunk_eval": train_chunk_eval,
         "eval_chunk_eval": eval_chunk_eval,
         "chunk_eval": train_chunk_eval,
         "render_summary": render_summary,
+        "skip_chunk_eval": bool(args.skip_chunk_eval),
     }
     write_json(args.out_dir / "train-report.json", report)
     return report
