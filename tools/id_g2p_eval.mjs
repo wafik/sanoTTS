@@ -64,5 +64,15 @@ for (const s of CASES) {
 const one = M.textToIds("ke").ids; // "ke" -> 1 vowel
 check("monosyllable stress", one.includes(120));
 
+// --- edge whitespace: no stress on empty segments --------------------------
+const edge = M.textToIds(" Selamat pagi ").ids; // 2 real words + edge blanks
+const edgeStress = edge.filter(v => v === 120).length;
+check("edge whitespace stress", edgeStress === 2, `${edgeStress} stress marks`);
+check("edge whitespace framing", edge[0] === 1 && edge[1] === 0 && edge[edge.length - 1] === 2);
+const empty = M.textToIds("").ids;
+check("empty input framing", empty.length === 3 && empty[0] === 1 && empty[1] === 0 && empty[2] === 2,
+  JSON.stringify(empty));
+check("empty input no stress", !empty.includes(120), JSON.stringify(empty));
+
 if (fails) { console.error(`\n${fails} check(s) FAILED`); process.exit(1); }
 console.log("\nall checks passed");

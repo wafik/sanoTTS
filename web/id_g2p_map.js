@@ -29,7 +29,7 @@
     const G2P = root.SaanoIdG2P, Table = root.SaanoIdTable;
     const ipa = G2P.toPhoneme(text, { english: false }).phonemes;
     const stressed = ipa.split(/(\s+)/).map(part =>
-      /\s/.test(part) ? part : insertStress(part)).join("");
+      /^\s*$/.test(part) ? part : insertStress(part)).join("");
     const ids = [Table.BOS, Table.PAD];
     const skipped = [];
     for (const ch of stressed.normalize("NFD")) {
