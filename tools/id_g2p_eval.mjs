@@ -1,0 +1,68 @@
+// id_g2p_eval.mjs -- runnable gate for the Indonesian indo-g2p front end.
+// Fails on: wrong glottal/schwa output on issue-listed words, wrong framing,
+// unmapped codepoints in the eval sentences. Exit 0 = pass.
+//   node tools/id_g2p_eval.mjs
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+import vm from "node:vm";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const web = resolve(here, "../web");
+
+// load the two browser scripts the way index.html does (classic globals)
+const ctx = { console, globalThis: {} };
+vm.createContext(ctx);
+vm.runInContext(readFileSync(resolve(web, "id_g2p.js"), "utf8"), ctx);
+vm.runInContext(readFileSync(resolve(web, "id_cp_table.js"), "utf8"), ctx);
+vm.runInContext(readFileSync(resolve(web, "id_g2p_map.js"), "utf8"), ctx);
+const G2P = ctx.globalThis.SaanoIdG2P, Table = ctx.globalThis.SaanoIdTable, M = ctx.globalThis.SaanoIdMap;
+if (!G2P) throw new Error("SaanoIdG2P missing -- run tools/build_id_g2p.sh");
+if (!Table) throw new Error("SaanoIdTable missing -- run tools/gen_id_cp_table.mjs");
+if (!M) throw new Error("SaanoIdMap missing");
+
+let fails = 0;
+const check = (name, cond, detail) => {
+  if (cond) console.log("PASS", name);
+  else { fails++; console.error("FAIL", name, detail ?? ""); }
+};
+
+// --- issue #2 measurements: glottal stops + schwa placement ---------------
+const GLOTTAL = ["rusak", "bakso", "rakyat", "bebek", "rek"];
+for (const w of GLOTTAL) {
+  const p = G2P.toPhoneme(w, { english: false }).phonemes;
+  check(`glottal in ${w}`, p.includes("ʔ"), p);
+}
+const SCHWA = { cerih: "tʃərih", dengan: "dəŋan", pergi: "pərgi" };
+for (const [w, want] of Object.entries(SCHWA)) {
+  const p = G2P.toPhoneme(w, { english: false }).phonemes;
+  check(`schwa in ${w}`, p === want, `${p} != ${want}`);
+}
+
+// --- framing: BOS PAD (id PAD)* EOS, ids resolve, stress present ----------
+const CASES = [
+  "Selamat pagi! Hari ini cuaca sangat cerah.",
+  "Halo! Senang bertemu dengan Anda hari ini.",
+  "Pagi ini cuaca cerah, mari kita mulai hari dengan semangat.",
+  "rusak bakso rakyat.",
+];
+for (const s of CASES) {
+  const { ids, skipped } = M.textToIds(s);
+  check(`framing ${s.slice(0, 20)}…`,
+    ids[0] === 1 && ids[1] === 0 && ids[ids.length - 1] === 2 && ids.length > 4,
+    JSON.stringify(ids.slice(0, 8)));
+  check(`no gaps ${s.slice(0, 20)}…`, ids.every((v, i) => i % 2 === 1 ? v === 0 : true));
+  check(`no skipped cps ${s.slice(0, 20)}…`, skipped.length === 0,
+    skipped.map(x => "U+" + x.cp.toString(16)).join(","));
+  const stressCount = ids.filter(v => v === 120).length; // ˈ = U+02C8
+  const wordCount = s.split(/\s+/).length;
+  check(`stress per word ${s.slice(0, 20)}…`, stressCount === wordCount,
+    `${stressCount} vs ${wordCount} words`);
+}
+
+// --- monosyllable stress lands at word start ------------------------------
+const one = M.textToIds("ke").ids; // "ke" -> 1 vowel
+check("monosyllable stress", one.includes(120));
+
+if (fails) { console.error(`\n${fails} check(s) FAILED`); process.exit(1); }
+console.log("\nall checks passed");
