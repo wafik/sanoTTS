@@ -12,6 +12,16 @@
 (function (root) {
   "use strict";
 
+  // indo-g2p emits ASCII 'g' (U+0067) in its IPA, but CP_ID_ID maps it to
+  // id 154, outside the voice's trained vocab (d_vocab = a_vocab = 122 in
+  // web/voices/indonesian/meta.json, so valid ids are 0..121). espeak emits
+  // ɡ (U+0261, id 66) for the same phoneme, so rewrite before lookup.
+  const CP_REWRITES = new Map([[0x67, 0x261]]);
+
+  // Defense in depth: never emit an id the voice cannot represent. Anything
+  // >= VOCAB_MAX + 1 is skipped and reported instead of fed to the models.
+  const VOCAB_MAX = 121;
+
   const VOWELS = /[aeiouɑɛɪɔəʊ]/;
 
   function insertStress(word) {
@@ -33,9 +43,9 @@
     const ids = [Table.BOS, Table.PAD];
     const skipped = [];
     for (const ch of stressed.normalize("NFD")) {
-      const cp = ch.codePointAt(0);
+      const cp = CP_REWRITES.get(ch.codePointAt(0)) ?? ch.codePointAt(0);
       const id = Table.MAP.get(cp);
-      if (id === undefined) { skipped.push({ cp }); continue; }
+      if (id === undefined || id > VOCAB_MAX) { skipped.push({ cp }); continue; }
       ids.push(id, Table.PAD);
     }
     ids.push(Table.EOS);

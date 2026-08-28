@@ -69,6 +69,19 @@ const edge = M.textToIds(" Selamat pagi ").ids; // 2 real words + edge blanks
 const edgeStress = edge.filter(v => v === 120).length;
 check("edge whitespace stress", edgeStress === 2, `${edgeStress} stress marks`);
 check("edge whitespace framing", edge[0] === 1 && edge[1] === 0 && edge[edge.length - 1] === 2);
+// --- ASCII 'g' rewrite + out-of-vocab guard --------------------------------
+// indo-g2p emits ASCII 'g' (U+0067) -> CP_ID_ID id 154, outside the voice's
+// vocab (d_vocab = a_vocab = 122; valid ids 0..121). espeak emits ɡ (U+0261)
+// -> id 66, which IS in vocab; the map must rewrite and never emit >= 122.
+const gs = M.textToIds("gajah gempa pagi");
+check("g rewrite to ɡ id 66", gs.ids.includes(66), JSON.stringify(gs.ids));
+check("no ASCII g id 154", !gs.ids.includes(154), JSON.stringify(gs.ids));
+check("no out-of-vocab ids", gs.ids.every(v => v < 122), "ids >= 122 present");
+const dq = M.textToIds('"');
+check("double-quote skipped", dq.skipped.length === 1 && dq.skipped[0].cp === 0x22,
+  JSON.stringify(dq));
+check("double-quote not emitted", !dq.ids.includes(150), JSON.stringify(dq.ids));
+
 const empty = M.textToIds("").ids;
 check("empty input framing", empty.length === 3 && empty[0] === 1 && empty[1] === 0 && empty[2] === 2,
   JSON.stringify(empty));
