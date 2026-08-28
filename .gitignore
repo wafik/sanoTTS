@@ -63,6 +63,7 @@ dist/
 logs/
 runs/
 tmp/
+.claude-flow/
 esp32c3/test/emu_out/
 
 # Host build products. Source files with similar names remain tracked.
