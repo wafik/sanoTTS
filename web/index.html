@@ -684,11 +684,11 @@ async function synthVoiceIndo(text){
   try {
     await loadIdG2p();
     const r = self.SaanoIdMap.textToIds(text);
-    if (!r.ids.length || r.skipped.length) throw new Error("unmapped/skip");
+    if (!r.ids.length) throw new Error("empty phoneme ids");
     if (r.skipped.length) log("indo-g2p skipped " + r.skipped.length + " codepoints");
     ids = Int32Array.from(r.ids);
   } catch (e) {
-    log("indo-g2p unavailable (" + (e && e.message || e) + ") -- using espeak-ng");
+    log("indo-g2p lane failed (" + (e && e.message || e) + ") -- using espeak-ng");
     setG2PVoice(bundle.meta.espeak_voice, bundle.meta.g2p_voice_slot);
     ids = g2pIds(text); via = "espeak-ng wasm";
   }
@@ -743,6 +743,7 @@ async function synthTrellis(text){
 async function synth(){
   $("go").disabled=true; $("log").textContent="";
   const setState = m => { $("state").textContent = m; };
+  window.__lastG2pVia = null;
   try{
     const text = $("text").value || "Hello.";
     const tStart = performance.now();
