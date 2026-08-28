@@ -543,6 +543,29 @@ function loadVoiceBundle(key, onProgress){
   }
   return voiceBundles.get(key);
 }
+function loadGlobalScript(url, globalName){
+  if (window[globalName]) return Promise.resolve();
+  return new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = url;
+    s.onload = () => window[globalName] ? res() : rej(new Error(url + " loaded but " + globalName + " missing"));
+    s.onerror = () => rej(new Error("failed to load " + url));
+    document.head.appendChild(s);
+  });
+}
+// indo-g2p lane for the indonesian voice (issue #2): espeak misplaces the
+// schwa on ~47% of words and never emits glottal stops. SaanoIdMap maps
+// indo-g2p IPA onto the same CP_ID_ID ids the voice was trained on. Falls
+// back to the espeak path if the bundle fails, so the demo never dies.
+let idG2pScripts = null;
+function loadIdG2p(){
+  if (!idG2pScripts) idG2pScripts = Promise.all([
+    loadGlobalScript("id_g2p.js", "SaanoIdG2P"),
+    loadGlobalScript("id_cp_table.js", "SaanoIdTable"),
+    loadGlobalScript("id_g2p_map.js", "SaanoIdMap"),
+  ]);
+  return idG2pScripts;
+}
 
 // Split text into per-sentence chunks so playback can start after the first
 // sentence instead of after the whole paragraph (and so no single synth call
@@ -655,6 +678,33 @@ async function synthVoice(key, text){
   if(n<0) throw new Error("snt_voice_synthesize returned "+n);
   return {pcm, ids, wall, sr:bundle.meta.sample_rate||SR};
 }
+async function synthVoiceIndo(text){
+  const bundle = await loadVoiceBundle("indonesian");
+  let ids, via = "indo-g2p";
+  try {
+    await loadIdG2p();
+    const r = self.SaanoIdMap.textToIds(text);
+    if (!r.ids.length || r.skipped.length) throw new Error("unmapped/skip");
+    if (r.skipped.length) log("indo-g2p skipped " + r.skipped.length + " codepoints");
+    ids = Int32Array.from(r.ids);
+  } catch (e) {
+    log("indo-g2p unavailable (" + (e && e.message || e) + ") -- using espeak-ng");
+    setG2PVoice(bundle.meta.espeak_voice, bundle.meta.g2p_voice_slot);
+    ids = g2pIds(text); via = "espeak-ng wasm";
+  }
+  window.__lastG2pVia = via;
+  const frontP = toHeap(Voice, bundle.front), decP = toHeap(Voice, bundle.dec);
+  const idsP = toHeap(Voice, new Uint8Array(ids.buffer, 0, ids.length * 4));
+  const outP = Voice._malloc(VOICE_OUT_CAP * 4);
+  const t0 = performance.now();
+  const n = Voice._snt_voice_synthesize(frontP, decP, idsP, ids.length, bundle.meta.length_scale, outP, VOICE_OUT_CAP);
+  const wall = (performance.now() - t0) / 1000;
+  let pcm = null;
+  if (n >= 0) { pcm = new Float32Array(n); pcm.set(Voice.HEAPF32.subarray(outP >> 2, (outP >> 2) + n)); }
+  [frontP, decP, idsP, outP].forEach(p => Voice._free(p));
+  if (n < 0) throw new Error("snt_voice_synthesize returned " + n);
+  return { pcm, ids, wall, sr: bundle.meta.sample_rate || SR };
+}
 // Trellis-RIFT lane. The phoneme path is NOT the Piper id table the other
 // voices use: espeak-ng emits IPA with stress marks and ties, trellis_frontend
 // applies the Misaki normalization, and the model consumes a character-level
@@ -706,7 +756,8 @@ async function synth(){
 
     const chunks = splitChunks(text);
     const doChunk = t => voice.trellis ? synthTrellis(t)
-                       : voice.key==="mcu" ? synthMcu(t) : synthVoice(voice.key, t);
+                       : voice.key==="mcu" ? synthMcu(t)
+                       : voice.key==="indonesian" ? synthVoiceIndo(t) : synthVoice(voice.key, t);
     let player=null, ttfu=null, totalIds=0, totalWall=0;
     const pcms=[];
     for (let i = 0; i < chunks.length; i++){
@@ -728,7 +779,7 @@ async function synth(){
     lastPcm = new Float32Array(total);
     let off = 0; for (const p of pcms){ lastPcm.set(p, off); off += p.length; }
     const secs = total/lastSr, rtf = totalWall/secs;
-    $("phon").textContent = totalIds + " ids (espeak-ng wasm)";
+    $("phon").textContent = totalIds + " ids (" + (window.__lastG2pVia || "espeak-ng wasm") + ")";
     $("dur").textContent = secs.toFixed(2) + " s @ " + (lastSr/1000).toFixed(2) + " kHz";
     $("time").textContent = ttfu.toFixed(2) + " s to first audio \u00B7 " + totalWall.toFixed(2) + " s total";
     $("rtf").textContent = rtf<1 ? (1/rtf).toFixed(1)+"\u00D7 faster than real time" : rtf.toFixed(2)+"\u00D7 real time";
