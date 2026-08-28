@@ -60,6 +60,27 @@ class Synthesizer:
         audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
         return SynthesisResult(audio=audio, sample_rate=self.sample_rate)
 
+    def synthesize_from_ids(self, ids: list[int]) -> SynthesisResult:
+        """Render from already-framed phoneme ids (no frontend).
+
+        The id sequence must follow the Piper framing convention::
+
+            [BOS, PAD, ph1, PAD, ph2, PAD, ..., EOS]
+
+        This is the same format returned by ``frontend.text_to_phoneme_ids``
+        or by the browser-side ``textToIds()`` (the indo-g2p web path).
+        No phoneme-table lookup or espeak call is performed.
+        """
+        ids_arr = np.asarray(ids, dtype=np.int64)
+        durations = models.duration_forward(
+            self._duration_tensors, self._duration_config, ids_arr,
+            length_scale=self.pack.duration_length_scale,
+        )
+        latent = models.acoustic_forward(self._acoustic_tensors, self._acoustic_config, ids_arr, durations)
+        audio = models.decoder_forward(self._decoder_tensors, self._decoder_config, latent)
+        audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
+        return SynthesisResult(audio=audio, sample_rate=self.sample_rate)
+
 
 def synthesize(
     text: str,

@@ -2,7 +2,7 @@
 // Fails on: wrong glottal/schwa output on issue-listed words, wrong framing,
 // unmapped codepoints in the eval sentences. Exit 0 = pass.
 //   node tools/id_g2p_eval.mjs
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import vm from "node:vm";
@@ -76,3 +76,12 @@ check("empty input no stress", !empty.includes(120), JSON.stringify(empty));
 
 if (fails) { console.error(`\n${fails} check(s) FAILED`); process.exit(1); }
 console.log("\nall checks passed");
+
+// --dump-ids artifacts/id_ids.json: emit new-pipeline ids for the renderer
+if (process.argv.includes("--dump-ids")) {
+  mkdirSync("artifacts", { recursive: true });
+  const out = {};
+  for (const s of CASES) out[s] = { ids: M.textToIds(s).ids };
+  writeFileSync("artifacts/id_ids.json", JSON.stringify(out, null, 1));
+  console.log("dumped artifacts/id_ids.json");
+}
