@@ -19,8 +19,9 @@ in the browser via WASM.
 
 **[ampixa.github.io/sanoTTS](https://ampixa.github.io/sanoTTS/)** — every voice
 synthesizes your text live in the browser. No server, no upload: text goes
-through an espeak-ng-in-WASM phonemizer and that voice's own neural stack, all
-client-side.
+through a phonemizer — espeak-ng in WASM for most voices, the bundled
+[indo-g2p](https://github.com/snowfluke/indo-g2p) JS for Indonesian — and that
+voice's own neural stack, all client-side.
 
 ## Install & use
 
@@ -104,7 +105,9 @@ visitor's browser.
 **Option B — no build, no npm**
 
 Copy `web/snt_g2p.js`, `web/snt_g2p.wasm`, `web/snt_g2p.data`,
-`web/snt_voice.js`, `web/snt_voice.wasm`, and `web/voices/` from this repo
+`web/snt_voice.js`, `web/snt_voice.wasm`, `web/voices/`, and — for the
+Indonesian voice's indo-g2p phonemizer — `web/id_g2p.js`,
+`web/id_cp_table.js`, `web/id_g2p_map.js` from this repo
 (or scrape them straight from `ampixa.github.io/sanoTTS`) onto your static
 host, and load them the same way `web/index.html` does:
 

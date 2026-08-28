@@ -367,8 +367,10 @@
   <hr>
 
   <h2 id="live">Synthesize live in your browser</h2>
-  <p class="note">Type anything. The text is phonemized by <b>espeak-ng compiled to
-  WebAssembly</b> (the same 275&nbsp;KB port that runs on the chip) and spoken by that
+  <p class="note">Type anything. Most voices are phonemized by <b>espeak-ng compiled to
+  WebAssembly</b> (the same 275&nbsp;KB port that runs on the chip); the Indonesian
+  voice uses the <a href="https://github.com/snowfluke/indo-g2p">indo-g2p</a>
+  phonemizer (bundled JS, MIT) instead. Either way the result is spoken by that
   voice's own neural stack &mdash; all client-side, no server. Pick a voice:</p>
 
   <div class="mascots" id="mascots"></div>
